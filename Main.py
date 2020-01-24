@@ -28,9 +28,8 @@ def distance(x,y):
 
 #Loop through every game in a season (1271 for 31 teams)
 with open("2018NHLShotInfo.csv", 'a') as f:
-   fieldnames = ["Shot", "X", "Y", "Shot_Type", "Shooter", "Team", "Home_Away", "Period", "Year"]
+   fieldnames = ["Shot", "X", "Y", "Shot_Type", "Shooter", "Team", "Home_Away", "Period", "Year", "GameID"]
    writer = csv.DictWriter(f, delimiter = ",", fieldnames=fieldnames)
-   writer.writeheader()
    for i in range(1,1272):
       try:
          #Get the API url
@@ -38,6 +37,7 @@ with open("2018NHLShotInfo.csv", 'a') as f:
          response = requests.get(url)
          home = response.json()["gameData"]["teams"]["home"]["triCode"]
          away = response.json()["gameData"]["teams"]["away"]["triCode"]
+         #p1Shooting = 0 #are you shooting at (89,0) or (-89,0) period 1?
          for j in range(1000):
             try:
                if response.json()["liveData"]["plays"]["allPlays"][j]["result"]["event"] == "Goal":
@@ -48,13 +48,14 @@ with open("2018NHLShotInfo.csv", 'a') as f:
                   gshot_type = response.json()["liveData"]["plays"]["allPlays"][j]["result"]["secondaryType"]
                   #desc = response.json()["liveData"]["plays"]["allPlays"][j]["result"]["description"]
                   gshooter = response.json()["liveData"]["plays"]["allPlays"][j]["players"][0]["player"]["fullName"]
+                  empty_net = response.json()["liveData"]["plays"]["allPlays"][j]["emptyNet"]
                   if gteam == home:
                      home_team = 1
                   else:
                      home_team = 0
                   #goals.append(distance(goalx,goaly))
                   #goal_shot.append([goalx, goaly, gshot_type, desc])
-                  writer.writerow({"Shot":"Goal", "X":goalx, "Y" : goaly, "Shot_Type" : gshot_type, "Shooter" : gshooter, "Team" : gteam, "Home_Away" : home_team, "Period" : gperiod , "Year" : YEAR})
+                  writer.writerow({"Shot":"Goal", "X":goalx, "Y" : goaly, "Shot_Type" : gshot_type, "Shooter" : gshooter, "Team" : gteam, "Home_Away" : home_team, "Period" : gperiod , "Year" : YEAR, "GameID" : i})
                if response.json()["liveData"]["plays"]["allPlays"][j]["result"]["event"] == "Shot":
                   nongoalx = float(response.json()["liveData"]["plays"]["allPlays"][j]["coordinates"]["x"])
                   nongoaly = float(response.json()["liveData"]["plays"]["allPlays"][j]["coordinates"]["y"])
@@ -69,7 +70,7 @@ with open("2018NHLShotInfo.csv", 'a') as f:
                      home_team = 0
                   #nongoals.append(distance(nongoalx,nongoaly))
                   #nongoal_shot.append([nongoalx, nongoaly, ngshot_type, ngdesc])
-                  writer.writerow({"Shot" : "ngshot", "X" : nongoalx, "Y" : nongoaly, "Shot_Type" : ngshot_type, "Shooter" : ngshooter, "Team" : ngteam, "Home_Away" : home_team, "Period" : ngperiod, "Year" : YEAR})
+                  writer.writerow({"Shot" : "ngshot", "X" : nongoalx, "Y" : nongoaly, "Shot_Type" : ngshot_type, "Shooter" : ngshooter, "Team" : ngteam, "Home_Away" : home_team, "Period" : ngperiod, "Year" : YEAR,  "GameID" : i})
             except IndexError:
                break
       except KeyError:
