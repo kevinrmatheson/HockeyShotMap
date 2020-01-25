@@ -8,7 +8,7 @@ import pandas as pd
 
 #The starting year of the season (by default this is the 2017-2018 season).
 #The earliest year that will work is 2010.
-YEAR = "2018"
+YEAR = "2016"
 
 ##Note periods go 1, 2, 3 with 4 OT and 5 SO##
 #Constants for the type of games played
@@ -27,7 +27,7 @@ def distance(x,y):
    return (sqrt((89-x)**2+(y)**2))
 
 #Loop through every game in a season (1271 for 31 teams)
-with open("2018NHLShotInfo.csv", 'a') as f:
+with open("2018NHLShotInfoV2.csv", 'a') as f:
    fieldnames = ["Shot", "X", "Y", "Shot_Type", "Shooter", "Team", "Home_Away", "Period", "Year", "GameID"]
    writer = csv.DictWriter(f, delimiter = ",", fieldnames=fieldnames)
    for i in range(1,1272):
