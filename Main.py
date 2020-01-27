@@ -8,7 +8,7 @@ import pandas as pd
 
 #The starting year of the season (by default this is the 2017-2018 season).
 #The earliest year that will work is 2010.
-YEAR = "2016"
+YEAR = "2013"
 
 ##Note periods go 1, 2, 3 with 4 OT and 5 SO##
 #Constants for the type of games played
