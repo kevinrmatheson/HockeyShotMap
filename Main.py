@@ -4,15 +4,22 @@ import hashlib
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from dataclasses import dataclass
 
 import requests
 
-LEGACY_API_BASE_URL = "https://statsapi.web.nhl.com/api/v1"
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 STATS_REST_BASE_URL = "https://api.nhle.com/stats/rest"
-DEFAULT_START_SEASON_FALLBACK = 2010
+# NHL-WHA merger took effect for the 1979-80 NHL season.
+MODERN_ERA_START_SEASON = 1979
+DEFAULT_START_SEASON_FALLBACK = MODERN_ERA_START_SEASON
+
+# Performance tuning defaults for long historical runs.
+DB_COMMIT_INTERVAL_GAMES = 50
+STATS_DISABLE_CHECK_GAMES = 25
+SEASON_END_PROBE_START_GAME = 900
+SEASON_END_EMPTY_STREAK_GAMES = 150
 
 # Supported NHL game type codes from the stats API.
 PRESEASON = "01"
@@ -20,7 +27,7 @@ REGULAR_SEASON = "02"
 PLAYOFFS = "03"
 ALLSTAR = "04"
 
-# Legacy CSV column order preserved for Tableau compatibility exports.
+# Stable CSV column order preserved for Tableau compatibility exports.
 CSV_FIELDNAMES = [
    "Shot",
    "X",
@@ -36,6 +43,9 @@ CSV_FIELDNAMES = [
 ]
 
 
+_HTTP_SESSION = requests.Session()
+
+
 @dataclass
 class ScrapeConfig:
    # Runtime settings for one scrape run.
@@ -48,9 +58,12 @@ class ScrapeConfig:
    export_csv: str | None = None
 
 
-def build_game_url(season: str, game_type: str, game_id: int) -> str:
-   # Legacy Stats API expects game id zero-padded to 4 digits.
-   return f"{LEGACY_API_BASE_URL}/game/{season}{game_type}{game_id:04d}/feed/live"
+def build_stats_shiftcharts_url() -> str:
+   return f"{STATS_REST_BASE_URL}/en/shiftcharts"
+
+
+def build_stats_games_url() -> str:
+   return f"{STATS_REST_BASE_URL}/en/game"
 
 
 def build_web_play_by_play_url(season: str, game_type: str, game_id: int) -> str:
@@ -61,7 +74,7 @@ def build_web_play_by_play_url(season: str, game_type: str, game_id: int) -> str
 
 def _fetch_json(url: str, timeout_seconds: int, params: dict | None = None) -> dict | None:
    try:
-      response = requests.get(url, timeout=timeout_seconds, params=params)
+      response = _HTTP_SESSION.get(url, timeout=timeout_seconds, params=params)
       response.raise_for_status()
       return response.json()
    except (requests.RequestException, ValueError) as exc:
@@ -69,24 +82,47 @@ def _fetch_json(url: str, timeout_seconds: int, params: dict | None = None) -> d
       return None
 
 
-def preflight_api_check(timeout_seconds: int) -> None:
-   # Fail fast with a clear message if the NHL API host is unavailable.
-   payload = _fetch_json(f"{LEGACY_API_BASE_URL}/seasons", timeout_seconds)
-   if payload is None:
-      raise RuntimeError(
-         "NHL API is unreachable. Check network/DNS access to statsapi.web.nhl.com and retry."
-      )
+def _fetch_json_allow_404(url: str, timeout_seconds: int, params: dict | None = None) -> dict | None:
+   # Some Edge endpoints are intermittently unavailable for certain seasons; treat 404 as optional.
+   try:
+      response = _HTTP_SESSION.get(url, timeout=timeout_seconds, params=params)
+      if response.status_code == 404:
+         logging.info("Optional endpoint unavailable (404): %s", url)
+         return None
+      response.raise_for_status()
+      return response.json()
+   except (requests.RequestException, ValueError) as exc:
+      logging.warning("Failed to fetch %s: %s", url, exc)
+      return None
+
+
+def edge_is_supported_for_season(season: str, game_type: str, timeout_seconds: int) -> bool:
+   # Edge payloads include an availability index; use it to skip unsupported seasons.
+   season_id = _season_id_yyyyyyyy(season)
+   probe = _fetch_json_allow_404(f"{WEB_API_BASE_URL}/edge/team-landing/{season_id}/{int(game_type)}", timeout_seconds)
+   if not isinstance(probe, dict):
+      return False
+
+   availability = probe.get("seasonsWithEdgeStats", [])
+   if not isinstance(availability, list):
+      return False
+
+   target_season_id = int(season_id)
+   target_game_type = int(game_type)
+   for entry in availability:
+      if not isinstance(entry, dict):
+         continue
+      if int(entry.get("id", 0)) != target_season_id:
+         continue
+      game_types = entry.get("gameTypes", [])
+      if isinstance(game_types, list) and target_game_type in game_types:
+         return True
+   return False
 
 
 def detect_available_sources(api_source: str, timeout_seconds: int) -> list[str]:
-   requested = ["legacy", "web"] if api_source == "both" else [api_source]
+   requested = ["web", "stats"] if api_source == "both" else [api_source]
    available = []
-
-   if "legacy" in requested:
-      if _fetch_json(f"{LEGACY_API_BASE_URL}/seasons", timeout_seconds) is not None:
-         available.append("legacy")
-      else:
-         logging.warning("Legacy Stats API unavailable: %s", LEGACY_API_BASE_URL)
 
    if "web" in requested:
       if _fetch_json(f"{WEB_API_BASE_URL}/season", timeout_seconds) is not None:
@@ -94,33 +130,16 @@ def detect_available_sources(api_source: str, timeout_seconds: int) -> list[str]
       else:
          logging.warning("Web API unavailable: %s", WEB_API_BASE_URL)
 
+   if "stats" in requested:
+      if _fetch_json(f"{STATS_REST_BASE_URL}/ping", timeout_seconds) is not None:
+         available.append("stats")
+      else:
+         logging.warning("Stats REST API unavailable: %s", STATS_REST_BASE_URL)
+
    if not available:
       raise RuntimeError("No requested NHL API sources are reachable. Check DNS/network access.")
 
    return available
-
-
-def fetch_game_feed(url: str, timeout_seconds: int) -> dict | None:
-   # Network and JSON errors are logged and treated as a skipped game.
-   return _fetch_json(url, timeout_seconds)
-
-
-def _extract_home_away(game_json: dict) -> tuple[str | None, str | None]:
-   # Pull team tri-codes once and reuse during event normalization.
-   teams = game_json.get("gameData", {}).get("teams", {})
-   home = teams.get("home", {}).get("triCode")
-   away = teams.get("away", {}).get("triCode")
-   return home, away
-
-
-def _extract_shooter(play: dict) -> str:
-   # The first named player is used as the shooter in this dataset.
-   players = play.get("players", [])
-   for player in players:
-      full_name = player.get("player", {}).get("fullName")
-      if full_name:
-         return full_name
-   return "Unknown"
 
 
 def _home_away_value(team_code: str | None, home_code: str | None, away_code: str | None) -> int | None:
@@ -195,6 +214,53 @@ def fetch_team_catalog(timeout_seconds: int) -> dict[str, int]:
    return catalog
 
 
+def fetch_season_game_numbers_from_stats(season: str, game_type: str, timeout_seconds: int) -> list[int]:
+   # Fetch one season's game manifest in a single call to avoid probing non-existent game IDs.
+   season_id = _season_id_yyyyyyyy(season)
+   payload = _fetch_json(
+      build_stats_games_url(),
+      timeout_seconds,
+      params={"cayenneExp": f"season={season_id} and gameType={int(game_type)}", "limit": -1},
+   )
+   if not isinstance(payload, dict):
+      return []
+
+   rows = payload.get("data", [])
+   if not isinstance(rows, list):
+      return []
+
+   # Prefer final/live games so current-season runs skip future schedule placeholders.
+   acceptable_states = {6, 7}
+   game_numbers: set[int] = set()
+   for row in rows:
+      if not isinstance(row, dict):
+         continue
+
+      state = row.get("gameStateId")
+      if state is not None:
+         try:
+            if int(state) not in acceptable_states:
+               continue
+         except (TypeError, ValueError):
+            continue
+
+      number = row.get("gameNumber")
+      if number is None:
+         game_id = row.get("id")
+         try:
+            number = int(game_id) % 10000 if game_id is not None else None
+         except (TypeError, ValueError):
+            number = None
+
+      try:
+         if number is not None:
+            game_numbers.add(int(number))
+      except (TypeError, ValueError):
+         continue
+
+   return sorted(game_numbers)
+
+
 def _player_id_from_roster_entry(player: dict) -> int | None:
    candidate_values = [
       player.get("playerId"),
@@ -266,62 +332,17 @@ def build_web_edge_goalie_detail_url(player_id: int, season: str, game_type: str
    return f"{WEB_API_BASE_URL}/edge/goalie-detail/{player_id}/{season_id}/{int(game_type)}"
 
 
-def normalize_event_to_row(play: dict, season: str, game_id: int, home_code: str | None, away_code: str | None) -> dict | None:
-   # Only include shot attempts that became a Shot or Goal event.
-   result = play.get("result", {})
-   event_name = result.get("event")
-   if event_name not in {"Goal", "Shot"}:
-      return None
-
-   # Skip events missing rink coordinates because location is required downstream.
-   coordinates = play.get("coordinates", {})
-   if "x" not in coordinates or "y" not in coordinates:
-      return None
-
-   team_code = play.get("team", {}).get("triCode")
-   period = play.get("about", {}).get("period")
-   shot_result = "Goal" if event_name == "Goal" else "ngshot"
-   shot_type = result.get("secondaryType", "Unknown")
-   shooter = _extract_shooter(play)
-
-   return {
-      "Shot": shot_result,
-      "X": float(coordinates["x"]),
-      "Y": float(coordinates["y"]),
-      "Shot_Type": shot_type,
-      "Shooter": shooter,
-      "Team": team_code,
-      "Home_Away": _home_away_value(team_code, home_code, away_code),
-      "Period": period,
-      "Year": season,
-      "GameID": game_id,
-      "API_Source": "legacy",
-   }
-
-
-def parse_shot_events(game_json: dict, season: str, game_id: int) -> list[dict]:
-   # Convert one game's play stream into normalized shot rows.
-   home_code, away_code = _extract_home_away(game_json)
-   plays = game_json.get("liveData", {}).get("plays", {}).get("allPlays", [])
-   rows = []
-   for play in plays:
-      row = normalize_event_to_row(play, season, game_id, home_code, away_code)
-      if row is None:
-         continue
-      rows.append(row)
-   return rows
-
-
 def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[dict]:
    # Parse shot and goal events from the newer gamecenter play-by-play payload.
-   home_code = (
-      game_json.get("homeTeam", {}).get("abbrev")
-      or game_json.get("gameData", {}).get("teams", {}).get("home", {}).get("triCode")
-   )
-   away_code = (
-      game_json.get("awayTeam", {}).get("abbrev")
-      or game_json.get("gameData", {}).get("teams", {}).get("away", {}).get("triCode")
-   )
+   home_team = game_json.get("homeTeam", {})
+   away_team = game_json.get("awayTeam", {})
+   home_code = home_team.get("abbrev") or game_json.get("gameData", {}).get("teams", {}).get("home", {}).get("triCode")
+   away_code = away_team.get("abbrev") or game_json.get("gameData", {}).get("teams", {}).get("away", {}).get("triCode")
+   team_id_to_code = {}
+   if home_team.get("id") and home_code:
+      team_id_to_code[int(home_team.get("id"))] = home_code
+   if away_team.get("id") and away_code:
+      team_id_to_code[int(away_team.get("id"))] = away_code
 
    plays = game_json.get("plays", [])
    rows = []
@@ -336,7 +357,18 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
       if x_coord is None or y_coord is None:
          continue
 
-      team_code = details.get("eventOwnerTeamTricode") or play.get("team", {}).get("triCode")
+      owner_team_id = details.get("eventOwnerTeamId")
+      try:
+         owner_team_id = int(owner_team_id) if owner_team_id is not None else None
+      except (TypeError, ValueError):
+         owner_team_id = None
+
+      team_code = (
+         details.get("eventOwnerTeamTricode")
+         or details.get("eventOwnerTeamAbbrev")
+         or (team_id_to_code.get(owner_team_id) if owner_team_id is not None else None)
+         or play.get("team", {}).get("triCode")
+      )
       shot_type = details.get("shotType") or details.get("secondaryType") or "Unknown"
       shooter = details.get("shootingPlayerName") or details.get("scoringPlayerName") or "Unknown"
       period = (
@@ -357,6 +389,53 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
             "Year": season,
             "GameID": game_id,
             "API_Source": "web",
+         }
+      )
+
+   return rows
+
+
+def _extract_record_list(payload: dict | list) -> list[dict]:
+   if isinstance(payload, list):
+      return [entry for entry in payload if isinstance(entry, dict)]
+   for key in ("data", "records", "items", "response"):
+      value = payload.get(key)
+      if isinstance(value, list):
+         return [entry for entry in value if isinstance(entry, dict)]
+   return []
+
+
+def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) -> list[dict]:
+   # Stats REST may include event/coordinate records for some games; keep parsing defensive.
+   rows = []
+   for record in _extract_record_list(payload):
+      event_type = str(
+         record.get("eventType")
+         or record.get("typeCode")
+         or record.get("eventDescription")
+         or ""
+      ).lower()
+      if "shot" not in event_type and "goal" not in event_type:
+         continue
+
+      x_coord = record.get("xCoord") if record.get("xCoord") is not None else record.get("xcoord")
+      y_coord = record.get("yCoord") if record.get("yCoord") is not None else record.get("ycoord")
+      if x_coord is None or y_coord is None:
+         continue
+
+      rows.append(
+         {
+            "Shot": "Goal" if "goal" in event_type else "ngshot",
+            "X": float(x_coord),
+            "Y": float(y_coord),
+            "Shot_Type": record.get("shotType") or "Unknown",
+            "Shooter": record.get("playerName") or record.get("lastName") or "Unknown",
+            "Team": record.get("teamAbbrev") or record.get("teamTriCode"),
+            "Home_Away": None,
+            "Period": record.get("period"),
+            "Year": season,
+            "GameID": game_id,
+            "API_Source": "stats",
          }
       )
 
@@ -391,7 +470,7 @@ def initialize_database(db_path: str) -> None:
             period INTEGER,
             season TEXT NOT NULL,
             game_id INTEGER NOT NULL,
-            api_source TEXT NOT NULL DEFAULT 'legacy'
+            api_source TEXT NOT NULL DEFAULT 'web'
          )
          """
       )
@@ -399,7 +478,7 @@ def initialize_database(db_path: str) -> None:
       cursor.execute("PRAGMA table_info(shots)")
       columns = {row[1] for row in cursor.fetchall()}
       if "api_source" not in columns:
-         cursor.execute("ALTER TABLE shots ADD COLUMN api_source TEXT NOT NULL DEFAULT 'legacy'")
+         cursor.execute("ALTER TABLE shots ADD COLUMN api_source TEXT NOT NULL DEFAULT 'web'")
 
       cursor.execute(
          """
@@ -436,45 +515,55 @@ def initialize_database(db_path: str) -> None:
       connection.commit()
 
 
+def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
+   if not rows:
+      return 0
+
+   params = [
+      (
+         _event_hash(row),
+         row["Shot"],
+         row["X"],
+         row["Y"],
+         row["Shot_Type"],
+         row["Shooter"],
+         row["Team"],
+         row["Home_Away"],
+         row["Period"],
+         row["Year"],
+         row["GameID"],
+         row.get("API_Source", "web"),
+      )
+      for row in rows
+   ]
+
+   before = cursor.connection.total_changes
+   cursor.executemany(
+      """
+      INSERT OR IGNORE INTO shots (
+         event_hash, shot_result, x, y, shot_type, shooter, team,
+         home_away, period, season, game_id, api_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      params,
+   )
+   return cursor.connection.total_changes - before
+
+
 def persist_rows(db_path: str, rows: list[dict]) -> int:
    # INSERT OR IGNORE prevents duplicate rows when scraping the same games again.
    if not rows:
       return 0
 
-   inserted = 0
    with sqlite3.connect(db_path) as connection:
       cursor = connection.cursor()
-      for row in rows:
-         cursor.execute(
-            """
-            INSERT OR IGNORE INTO shots (
-               event_hash, shot_result, x, y, shot_type, shooter, team,
-               home_away, period, season, game_id, api_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-               _event_hash(row),
-               row["Shot"],
-               row["X"],
-               row["Y"],
-               row["Shot_Type"],
-               row["Shooter"],
-               row["Team"],
-               row["Home_Away"],
-               row["Period"],
-               row["Year"],
-               row["GameID"],
-               row.get("API_Source", "legacy"),
-            ),
-         )
-         if cursor.rowcount == 1:
-            inserted += 1
+      inserted = _persist_rows_with_cursor(cursor, rows)
       connection.commit()
    return inserted
 
 
 def export_to_csv(db_path: str, csv_path: str) -> int:
-   # Optional legacy export so existing Tableau workflows still work.
+   # Optional Tableau-compatible export with stable column order.
    with sqlite3.connect(db_path) as connection:
       cursor = connection.cursor()
       cursor.execute(
@@ -514,19 +603,42 @@ def capture_edge_summary_snapshots(db_path: str, season: str, game_type: str, ti
    # skating speed, high-danger SOG, distance skated, and zone-time totals.
    season_id = _season_id_yyyyyyyy(season)
    edge_game_type = str(int(game_type))
-   endpoints = [
+   required_endpoints = [
       f"{WEB_API_BASE_URL}/edge/team-landing/{season_id}/{edge_game_type}",
       f"{WEB_API_BASE_URL}/edge/skater-landing/{season_id}/{edge_game_type}",
       f"{WEB_API_BASE_URL}/edge/goalie-landing/{season_id}/{edge_game_type}",
+   ]
+   optional_endpoints = [
       f"{WEB_API_BASE_URL}/edge/by-the-numbers",
    ]
 
    inserted = 0
-   fetched_at = datetime.utcnow().isoformat(timespec="seconds")
+   fetched_at = datetime.now(UTC).isoformat(timespec="seconds")
    with sqlite3.connect(db_path) as connection:
       cursor = connection.cursor()
-      for endpoint in endpoints:
+      for endpoint in required_endpoints:
          payload = _fetch_json(endpoint, timeout_seconds)
+         if payload is None:
+            continue
+
+         cursor.execute(
+            """
+            INSERT OR REPLACE INTO edge_payloads (season, game_type, endpoint, source, payload_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+               season,
+               game_type,
+               endpoint,
+               "web",
+               json.dumps(payload),
+               fetched_at,
+            ),
+         )
+         inserted += 1
+
+      for endpoint in optional_endpoints:
+         payload = _fetch_json_allow_404(endpoint, timeout_seconds)
          if payload is None:
             continue
 
@@ -560,8 +672,30 @@ def _store_edge_detail_payload(
    entity_id: str,
    endpoint: str,
    payload: dict,
+   cursor: sqlite3.Cursor | None = None,
 ) -> None:
-   fetched_at = datetime.utcnow().isoformat(timespec="seconds")
+   fetched_at = datetime.now(UTC).isoformat(timespec="seconds")
+   if cursor is not None:
+      cursor.execute(
+         """
+         INSERT OR REPLACE INTO edge_detail_payloads
+         (season, game_type, source, snapshot_type, entity_type, entity_id, endpoint, payload_json, fetched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         """,
+         (
+            season,
+            game_type,
+            source,
+            snapshot_type,
+            entity_type,
+            str(entity_id),
+            endpoint,
+            json.dumps(payload),
+            fetched_at,
+         ),
+      )
+      return
+
    with sqlite3.connect(db_path) as connection:
       cursor = connection.cursor()
       cursor.execute(
@@ -594,7 +728,10 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
    # Goalie detail captures GAA, games above .900, goal differential per 60, goal support,
    # point percentage, and goalie shot-location summaries/details.
    if not team_codes:
-      logging.warning("No team codes were collected for season %s, skipping Edge deep crawl.", season)
+      logging.warning(
+         "No team codes were collected for season %s, skipping Edge deep crawl to avoid noisy 404 fan-out.",
+         season,
+      )
       return 0
 
    team_catalog = fetch_team_catalog(timeout_seconds)
@@ -605,77 +742,85 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
    total_snapshots = 0
    edge_game_type = str(int(game_type))
 
-   for team_code in sorted(team_codes):
-      team_id = team_catalog.get(team_code.upper())
-      if team_id is None:
-         logging.warning("Could not map team code %s to a team id; skipping team detail.", team_code)
-         continue
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
 
-      team_detail_endpoint = build_web_edge_team_detail_url(team_id, season, game_type)
-      team_detail_payload = _fetch_json(team_detail_endpoint, timeout_seconds)
-      if team_detail_payload is not None:
+      for team_code in sorted(team_codes):
+         team_id = team_catalog.get(team_code.upper())
+         if team_id is None:
+            logging.warning("Could not map team code %s to a team id; skipping team detail.", team_code)
+            continue
+
+         team_detail_endpoint = build_web_edge_team_detail_url(team_id, season, game_type)
+         team_detail_payload = _fetch_json_allow_404(team_detail_endpoint, timeout_seconds)
+         if team_detail_payload is not None:
+            _store_edge_detail_payload(
+               db_path,
+               season,
+               edge_game_type,
+               "web",
+               "team-detail",
+               "team",
+               str(team_id),
+               team_detail_endpoint,
+               team_detail_payload,
+               cursor,
+            )
+            total_snapshots += 1
+
+         roster_endpoint = build_web_roster_url(team_code, season)
+         roster_payload = _fetch_json_allow_404(roster_endpoint, timeout_seconds)
+         if roster_payload is None:
+            continue
+
          _store_edge_detail_payload(
             db_path,
             season,
             edge_game_type,
             "web",
-            "team-detail",
+            "roster",
             "team",
-            str(team_id),
-            team_detail_endpoint,
-            team_detail_payload,
+            team_code,
+            roster_endpoint,
+            roster_payload,
+            cursor,
          )
          total_snapshots += 1
 
-      roster_endpoint = build_web_roster_url(team_code, season)
-      roster_payload = _fetch_json(roster_endpoint, timeout_seconds)
-      if roster_payload is None:
-         continue
+         for player in _extract_roster_players(roster_payload):
+            player_id = _player_id_from_roster_entry(player)
+            if player_id is None:
+               continue
 
-      _store_edge_detail_payload(
-         db_path,
-         season,
-         edge_game_type,
-         "web",
-         "roster",
-         "team",
-         team_code,
-         roster_endpoint,
-         roster_payload,
-      )
-      total_snapshots += 1
+            position_code = _player_position_code(player)
+            is_goalie = str(position_code).upper() == "G"
 
-      for player in _extract_roster_players(roster_payload):
-         player_id = _player_id_from_roster_entry(player)
-         if player_id is None:
-            continue
+            if is_goalie:
+               player_endpoint = build_web_edge_goalie_detail_url(player_id, season, game_type)
+               snapshot_type = "goalie-detail"
+            else:
+               player_endpoint = build_web_edge_skater_detail_url(player_id, season, game_type)
+               snapshot_type = "skater-detail"
 
-         position_code = _player_position_code(player)
-         is_goalie = str(position_code).upper() == "G"
+            player_payload = _fetch_json_allow_404(player_endpoint, timeout_seconds)
+            if player_payload is None:
+               continue
 
-         if is_goalie:
-            player_endpoint = build_web_edge_goalie_detail_url(player_id, season, game_type)
-            snapshot_type = "goalie-detail"
-         else:
-            player_endpoint = build_web_edge_skater_detail_url(player_id, season, game_type)
-            snapshot_type = "skater-detail"
+            _store_edge_detail_payload(
+               db_path,
+               season,
+               edge_game_type,
+               "web",
+               snapshot_type,
+               "player",
+               str(player_id),
+               player_endpoint,
+               player_payload,
+               cursor,
+            )
+            total_snapshots += 1
 
-         player_payload = _fetch_json(player_endpoint, timeout_seconds)
-         if player_payload is None:
-            continue
-
-         _store_edge_detail_payload(
-            db_path,
-            season,
-            edge_game_type,
-            "web",
-            snapshot_type,
-            "player",
-            str(player_id),
-            player_endpoint,
-            player_payload,
-         )
-         total_snapshots += 1
+      connection.commit()
 
    return total_snapshots
 
@@ -689,41 +834,126 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
    edge_payloads_inserted = 0
    edge_detail_payloads_inserted = 0
    team_codes_seen: set[str] = set()
+   game_numbers = list(range(config.start_game, config.end_game + 1))
+   if "stats" in active_sources:
+      manifest_numbers = fetch_season_game_numbers_from_stats(config.season, config.game_type, config.timeout_seconds)
+      if manifest_numbers:
+         game_numbers = [n for n in manifest_numbers if config.start_game <= n <= config.end_game]
+         logging.info(
+            "Season %s: loaded %s game numbers from stats manifest (range-filtered).",
+            config.season,
+            len(game_numbers),
+         )
+      else:
+         logging.info(
+            "Season %s: stats game manifest unavailable, falling back to numeric game sweep.",
+            config.season,
+         )
 
-   for game_id in range(config.start_game, config.end_game + 1):
-      rows = []
+   total_games_to_check = len(game_numbers)
 
-      if "legacy" in active_sources:
-         legacy_url = build_game_url(config.season, config.game_type, game_id)
-         legacy_json = fetch_game_feed(legacy_url, config.timeout_seconds)
-         if legacy_json is not None:
-            rows.extend(parse_shot_events(legacy_json, config.season, game_id))
+   # If Stats REST yields zero usable rows across many checked games, stop calling it for this season.
+   stats_enabled = "stats" in active_sources
+   stats_games_checked = 0
+   stats_rows_seen = 0
+   stats_disable_threshold = STATS_DISABLE_CHECK_GAMES
+   empty_game_streak = 0
 
-      if "web" in active_sources:
-         web_url = build_web_play_by_play_url(config.season, config.game_type, game_id)
-         web_json = _fetch_json(web_url, config.timeout_seconds)
-         if web_json is not None:
-            rows.extend(parse_web_shot_events(web_json, config.season, game_id))
+   edge_supported = False
+   if "web" in active_sources and (capture_edge or capture_edge_deep):
+      edge_supported = edge_is_supported_for_season(config.season, config.game_type, config.timeout_seconds)
+      if not edge_supported:
+         logging.info("Season %s: skipping EDGE capture because season is not listed in seasonsWithEdgeStats.", config.season)
 
-      if not rows:
-         continue
+   with sqlite3.connect(config.db_path) as connection:
+      cursor = connection.cursor()
 
-      inserted = persist_rows(config.db_path, rows)
-      games_processed += 1
-      rows_inserted += inserted
-      for row in rows:
-         team_code = row.get("Team")
-         if team_code:
-            team_codes_seen.add(str(team_code).upper())
+      for index, game_id in enumerate(game_numbers, start=1):
+         rows = []
+         game_index = index
 
-      logging.info(
-         "Game %s parsed rows=%s inserted=%s",
-         game_id,
-         len(rows),
-         inserted,
-      )
+         if "web" in active_sources:
+            web_url = build_web_play_by_play_url(config.season, config.game_type, game_id)
+            web_json = _fetch_json_allow_404(web_url, config.timeout_seconds)
+            if web_json is not None:
+               rows.extend(parse_web_shot_events(web_json, config.season, game_id))
 
-   if capture_edge and "web" in active_sources:
+         if stats_enabled:
+            full_game_id = int(f"{config.season}{config.game_type}{game_id:04d}")
+            stats_payload = _fetch_json_allow_404(
+               build_stats_shiftcharts_url(),
+               config.timeout_seconds,
+               params={"cayenneExp": f"gameId={full_game_id}", "limit": -1},
+            )
+            if stats_payload is not None:
+               stats_rows = parse_stats_shift_events(stats_payload, config.season, game_id)
+               stats_rows_seen += len(stats_rows)
+               rows.extend(stats_rows)
+
+            stats_games_checked += 1
+            if stats_games_checked >= stats_disable_threshold and stats_rows_seen == 0:
+               logging.info(
+                  "Season %s: disabling stats source after %s checked games with 0 stats rows.",
+                  config.season,
+                  stats_games_checked,
+               )
+               stats_enabled = False
+
+         if not rows:
+            empty_game_streak += 1
+            if game_index % 50 == 0 or game_index == total_games_to_check:
+               logging.info(
+                  "Season %s progress: checked %s/%s games, games_with_rows=%s, rows_inserted=%s",
+                  config.season,
+                  game_index,
+                  total_games_to_check,
+                  games_processed,
+                  rows_inserted,
+               )
+
+            if game_id >= SEASON_END_PROBE_START_GAME and empty_game_streak >= SEASON_END_EMPTY_STREAK_GAMES:
+               logging.info(
+                  "Season %s: stopping early at game %s after %s consecutive empty games.",
+                  config.season,
+                  game_id,
+                  empty_game_streak,
+               )
+               break
+            continue
+
+         empty_game_streak = 0
+         inserted = _persist_rows_with_cursor(cursor, rows)
+         games_processed += 1
+         rows_inserted += inserted
+         if capture_edge_deep:
+            for row in rows:
+               team_code = row.get("Team")
+               if team_code:
+                  team_codes_seen.add(str(team_code).upper())
+
+         logging.info(
+            "Game %s parsed rows=%s inserted=%s",
+            game_id,
+            len(rows),
+            inserted,
+         )
+
+         if game_index % DB_COMMIT_INTERVAL_GAMES == 0:
+            connection.commit()
+
+         if game_index % 50 == 0 or game_index == total_games_to_check:
+            logging.info(
+               "Season %s progress: checked %s/%s games, games_with_rows=%s, rows_inserted=%s",
+               config.season,
+               game_index,
+               total_games_to_check,
+               games_processed,
+               rows_inserted,
+            )
+
+      connection.commit()
+
+   if capture_edge and "web" in active_sources and edge_supported:
       edge_payloads_inserted = capture_edge_summary_snapshots(
          config.db_path,
          config.season,
@@ -736,7 +966,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
          edge_payloads_inserted,
       )
 
-   if capture_edge_deep and "web" in active_sources:
+   if capture_edge_deep and "web" in active_sources and edge_supported:
       edge_detail_payloads_inserted = capture_edge_deep_snapshots(
          config.db_path,
          config.season,
@@ -759,7 +989,7 @@ def current_nhl_season_start_year(today: datetime | None = None) -> int:
    return today.year if today.month >= 9 else today.year - 1
 
 
-def discover_earliest_full_season(game_type: str, timeout_seconds: int, preferred_source: str = "legacy") -> int:
+def discover_earliest_full_season(game_type: str, timeout_seconds: int, preferred_source: str = "web") -> int:
    # Detect earliest season using the preferred source, with safe fallback.
    if preferred_source == "web":
       seasons_payload = _fetch_json(f"{WEB_API_BASE_URL}/season", timeout_seconds)
@@ -780,43 +1010,22 @@ def discover_earliest_full_season(game_type: str, timeout_seconds: int, preferre
             season_ids.append(season_id)
 
       if season_ids:
-         return int(sorted(season_ids)[0][:4])
+         return max(int(sorted(season_ids)[0][:4]), MODERN_ERA_START_SEASON)
       return DEFAULT_START_SEASON_FALLBACK
 
-   # Legacy mode: verify schedule and game-feed availability.
-   seasons_payload = _fetch_json(f"{LEGACY_API_BASE_URL}/seasons", timeout_seconds)
-   if not seasons_payload:
-      return DEFAULT_START_SEASON_FALLBACK
+   if preferred_source == "stats":
+      seasons_payload = _fetch_json(f"{STATS_REST_BASE_URL}/en/season", timeout_seconds)
+      if not seasons_payload:
+         return DEFAULT_START_SEASON_FALLBACK
 
-   season_ids = []
-   for season in seasons_payload.get("seasons", []):
-      season_id = str(season.get("seasonId", ""))
-      if len(season_id) == 8 and season_id.isdigit():
-         season_ids.append(season_id)
+      season_ids = []
+      for season in _extract_record_list(seasons_payload):
+         season_id = str(season.get("id") or season.get("seasonId") or "")
+         if len(season_id) == 8 and season_id.isdigit():
+            season_ids.append(season_id)
 
-   for season_id in sorted(season_ids):
-      start_year = int(season_id[:4])
-      schedule = _fetch_json(
-         f"{LEGACY_API_BASE_URL}/schedule",
-         timeout_seconds,
-         params={"season": season_id, "gameType": game_type},
-      )
-      if not schedule or schedule.get("totalItems", 0) == 0:
-         continue
-
-      dates = schedule.get("dates", [])
-      if not dates or not dates[0].get("games") or not dates[-1].get("games"):
-         continue
-
-      first_game_pk = dates[0]["games"][0].get("gamePk")
-      last_game_pk = dates[-1]["games"][-1].get("gamePk")
-      if not first_game_pk or not last_game_pk:
-         continue
-
-      first_feed = _fetch_json(f"{LEGACY_API_BASE_URL}/game/{first_game_pk}/feed/live", timeout_seconds)
-      last_feed = _fetch_json(f"{LEGACY_API_BASE_URL}/game/{last_game_pk}/feed/live", timeout_seconds)
-      if first_feed and last_feed:
-         return start_year
+      if season_ids:
+         return max(int(sorted(season_ids)[0][:4]), MODERN_ERA_START_SEASON)
 
    return DEFAULT_START_SEASON_FALLBACK
 
@@ -833,9 +1042,9 @@ def parse_args() -> argparse.Namespace:
    # CLI keeps scrape settings out of the source code.
    parser = argparse.ArgumentParser(description="Scrape NHL shot and goal events into SQLite.")
    parser.add_argument("--season", default=None, help="Single season start year (for example 2013 for 2013-2014).")
-   parser.add_argument("--start-season", type=int, default=None, help="Start season for multi-season run. Defaults to earliest full API season.")
+   parser.add_argument("--start-season", type=int, default=None, help="Start season for multi-season run. Defaults to 1979 (NHL-WHA merger era floor).")
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season for multi-season run. Defaults to current NHL season.")
-   parser.add_argument("--api-source", default="both", choices=["legacy", "web", "both"], help="Choose legacy API, newer web API, or both.")
+   parser.add_argument("--api-source", default="both", choices=["web", "stats", "both"], help="Choose Web API, Stats REST API, or both.")
    parser.add_argument("--capture-edge", action="store_true", help="Capture NHL Edge summary payloads when web API is enabled.")
    parser.add_argument("--capture-edge-deep", action="store_true", help="Capture NHL Edge team and player detail payloads after each season.")
    parser.add_argument("--game-type", default=REGULAR_SEASON, choices=[PRESEASON, REGULAR_SEASON, PLAYOFFS, ALLSTAR])
@@ -843,7 +1052,7 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--end-game", type=int, default=1271)
    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds.")
    parser.add_argument("--db-path", default="hockey_shots.db", help="SQLite database path.")
-   parser.add_argument("--export-csv", default=None, help="Optional legacy CSV export path.")
+   parser.add_argument("--export-csv", default=None, help="Optional Tableau-compatible CSV export path.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -863,12 +1072,19 @@ def main() -> None:
    if args.season is not None:
       seasons_to_run = [str(args.season)]
    else:
-      discovery_source = "legacy" if "legacy" in active_sources else "web"
+      discovery_source = "web" if "web" in active_sources else "stats"
       resolved_start = args.start_season if args.start_season is not None else discover_earliest_full_season(
          args.game_type,
          args.timeout,
          preferred_source=discovery_source,
       )
+      if resolved_start < MODERN_ERA_START_SEASON:
+         logging.info(
+            "Clamping start season from %s to %s (modern NHL era floor).",
+            resolved_start,
+            MODERN_ERA_START_SEASON,
+         )
+         resolved_start = MODERN_ERA_START_SEASON
       logging.info("Using start season %s", resolved_start)
       seasons_to_run = season_range(resolved_start, args.end_season)
 

@@ -11,86 +11,46 @@ import requests
 
 
 class TestMainPipeline(unittest.TestCase):
-    def test_build_game_url(self):
-        url = Main.build_game_url("2013", Main.REGULAR_SEASON, 7)
+    def test_build_web_play_by_play_url(self):
+        url = Main.build_web_play_by_play_url("2013", Main.REGULAR_SEASON, 7)
         self.assertEqual(
             url,
-            "https://statsapi.web.nhl.com/api/v1/game/2013020007/feed/live",
+            "https://api-web.nhle.com/v1/gamecenter/2013020007/play-by-play",
         )
 
-    def test_parse_shot_events_valid_and_skips_missing_coordinates(self):
-        payload = {
-            "gameData": {
-                "teams": {
-                    "home": {"triCode": "TOR"},
-                    "away": {"triCode": "MTL"},
-                }
-            },
-            "liveData": {
-                "plays": {
-                    "allPlays": [
-                        {
-                            "result": {"event": "Goal", "secondaryType": "Wrist Shot"},
-                            "team": {"triCode": "TOR"},
-                            "about": {"period": 1},
-                            "coordinates": {"x": 45, "y": -10},
-                            "players": [{"player": {"fullName": "Player One"}}],
-                        },
-                        {
-                            "result": {"event": "Shot", "secondaryType": "Slap Shot"},
-                            "team": {"triCode": "MTL"},
-                            "about": {"period": 2},
-                            "coordinates": {"x": -33, "y": 8},
-                            "players": [{"player": {"fullName": "Player Two"}}],
-                        },
-                        {
-                            "result": {"event": "Shot", "secondaryType": "Backhand"},
-                            "team": {"triCode": "TOR"},
-                            "about": {"period": 3},
-                        },
+    def test_build_stats_shiftcharts_url(self):
+        self.assertEqual(
+            Main.build_stats_shiftcharts_url(),
+            "https://api.nhle.com/stats/rest/en/shiftcharts",
+        )
+
+    def test_build_stats_games_url(self):
+        self.assertEqual(
+            Main.build_stats_games_url(),
+            "https://api.nhle.com/stats/rest/en/game",
+        )
+
+    def test_fetch_season_game_numbers_from_stats_filters_and_sorts(self):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": [
+                        {"gameNumber": 2, "gameStateId": 7},
+                        {"gameNumber": 1, "gameStateId": 6},
+                        {"gameNumber": 3, "gameStateId": 1},
+                        {"id": 2023020042, "gameStateId": 7},
                     ]
                 }
-            },
-        }
 
-        rows = Main.parse_shot_events(payload, "2013", 99)
-        self.assertEqual(len(rows), 2)
+        with patch.object(Main._HTTP_SESSION, "get", return_value=FakeResponse()):
+            numbers = Main.fetch_season_game_numbers_from_stats("2023", Main.REGULAR_SEASON, 10)
 
-        goal_row = rows[0]
-        shot_row = rows[1]
-
-        self.assertEqual(goal_row["Shot"], "Goal")
-        self.assertEqual(goal_row["Home_Away"], 1)
-        self.assertEqual(shot_row["Shot"], "ngshot")
-        self.assertEqual(shot_row["Home_Away"], 0)
-
-    def test_parse_shot_events_handles_missing_optional_fields(self):
-        payload = {
-            "gameData": {
-                "teams": {
-                    "home": {"triCode": "NYR"},
-                    "away": {"triCode": "BOS"},
-                }
-            },
-            "liveData": {
-                "plays": {
-                    "allPlays": [
-                        {
-                            "result": {"event": "Shot"},
-                            "team": {"triCode": "BOS"},
-                            "about": {"period": 1},
-                            "coordinates": {"x": 10, "y": 5},
-                            "players": [],
-                        }
-                    ]
-                }
-            },
-        }
-
-        rows = Main.parse_shot_events(payload, "2016", 1)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["Shot_Type"], "Unknown")
-        self.assertEqual(rows[0]["Shooter"], "Unknown")
+        self.assertEqual(numbers, [1, 2, 42])
 
     def test_parse_web_shot_events(self):
         payload = {
@@ -150,6 +110,43 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(Main._player_id_from_roster_entry(players[0]), 101)
         self.assertEqual(Main._player_position_code(players[0]), "C")
         self.assertEqual(Main._player_position_code(players[1]), "G")
+
+    def test_edge_is_supported_for_season_true(self):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "seasonsWithEdgeStats": [
+                        {"id": 20212022, "gameTypes": [2, 3]},
+                        {"id": 20222023, "gameTypes": [2, 3]},
+                    ]
+                }
+
+        with patch.object(Main._HTTP_SESSION, "get", return_value=FakeResponse()):
+            supported = Main.edge_is_supported_for_season("2022", Main.REGULAR_SEASON, 10)
+        self.assertTrue(supported)
+
+    def test_edge_is_supported_for_season_false(self):
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "seasonsWithEdgeStats": [
+                        {"id": 20232024, "gameTypes": [2, 3]},
+                    ]
+                }
+
+        with patch.object(Main._HTTP_SESSION, "get", return_value=FakeResponse()):
+            supported = Main.edge_is_supported_for_season("2022", Main.REGULAR_SEASON, 10)
+        self.assertFalse(supported)
 
     def test_edge_detail_url_builders(self):
         self.assertEqual(
@@ -225,39 +222,58 @@ class TestMainPipeline(unittest.TestCase):
                 return self._payload
 
         def fake_get(url, timeout=None, params=None):
-            if url.endswith("/seasons"):
+            if url.endswith("/season"):
                 return FakeResponse(
-                    {
-                        "seasons": [
-                            {"seasonId": "20082009"},
-                            {"seasonId": "20092010"},
-                        ]
-                    }
+                    ["20082009", "20092010"]
                 )
-            if url.endswith("/schedule") and params == {"season": "20082009", "gameType": Main.REGULAR_SEASON}:
-                return FakeResponse({"totalItems": 0, "dates": []})
-            if url.endswith("/schedule") and params == {"season": "20092010", "gameType": Main.REGULAR_SEASON}:
-                return FakeResponse(
-                    {
-                        "totalItems": 2,
-                        "dates": [
-                            {"games": [{"gamePk": 2009020001}]},
-                            {"games": [{"gamePk": 2009021230}]},
-                        ],
-                    }
-                )
-            if url.endswith("/game/2009020001/feed/live"):
-                return FakeResponse({"ok": True})
-            if url.endswith("/game/2009021230/feed/live"):
-                return FakeResponse({"ok": True})
             raise AssertionError(f"Unexpected URL call: {url} params={params}")
 
-        with patch("Main.requests.get", side_effect=fake_get):
+        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
             earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
-        self.assertEqual(earliest, 2009)
+        self.assertEqual(earliest, 2008)
+
+    def test_discover_earliest_full_season_stats_source(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, timeout=None, params=None):
+            if url.endswith("/en/season"):
+                return FakeResponse({"data": [{"id": "20102011"}, {"id": "20112012"}]})
+            raise AssertionError(f"Unexpected URL call: {url} params={params}")
+
+        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
+            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10, preferred_source="stats")
+        self.assertEqual(earliest, 2010)
+
+    def test_discover_earliest_full_season_clamps_to_modern_floor(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, timeout=None, params=None):
+            if url.endswith("/season"):
+                return FakeResponse(["19171918", "19791980"])
+            raise AssertionError(f"Unexpected URL call: {url} params={params}")
+
+        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
+            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
+        self.assertEqual(earliest, Main.MODERN_ERA_START_SEASON)
 
     def test_discover_earliest_full_season_fallback_on_failure(self):
-        with patch("Main.requests.get", side_effect=requests.RequestException("network down")):
+        with patch.object(Main._HTTP_SESSION, "get", side_effect=requests.RequestException("network down")):
             earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
         self.assertEqual(earliest, Main.DEFAULT_START_SEASON_FALLBACK)
 

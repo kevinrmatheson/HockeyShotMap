@@ -4,7 +4,7 @@ HockeyShotMap is a hockey data collection project for building shot and goal dat
 
 ## Script roles
 
-- [Main.py](Main.py) is the active NHL Stats API ETL pipeline.
+- [Main.py](Main.py) is the active NHL Web API + Stats REST ETL pipeline.
 - [Scraper.py](Scraper.py) is a separate HockeyDB prototype and is not integrated into the active pipeline.
 - [DataCleaning.py](DataCleaning.py) contains a basic CSV loader utility for follow-on analysis work.
 
@@ -21,7 +21,7 @@ For each shot or goal event, [Main.py](Main.py) records:
 - period
 - season year
 - game id
-- API source (`legacy` or `web`)
+- API source (`web` or `stats`)
 
 In addition, when enabled, the scraper stores NHL Edge payload snapshots from the Web API in a separate SQLite table.
 
@@ -37,20 +37,20 @@ Pipeline flow:
 
 1. Build game URLs for one or both NHL API families.
 2. Fetch JSON from selected source(s):
-	- Legacy Stats API (`statsapi.web.nhl.com`)
 	- NHL Web API / Gamecenter (`api-web.nhle.com`)
+	- NHL Stats REST API (`api.nhle.com/stats/rest`)
 3. Parse `Goal` and `Shot` events into normalized rows.
 4. Persist rows into SQLite with duplicate-safe inserts.
 5. Optionally capture NHL Edge summary payloads.
 6. Optionally export CSV format for visualization workflows.
 
-Legacy game feed URL format:
-
-`https://statsapi.web.nhl.com/api/v1/game/{season}{game_type}{game_id}/feed/live`
-
 Web API play-by-play URL format:
 
 `https://api-web.nhle.com/v1/gamecenter/{full_game_id}/play-by-play`
+
+Stats REST shiftcharts URL format:
+
+`https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={full_game_id}&limit=-1`
 
 By default, the script uses:
 
@@ -76,13 +76,15 @@ Default run (regular season, full game range, SQLite output):
 python Main.py
 ```
 
-By default this runs from the earliest full season detected from NHL API endpoints through the current NHL season.
+By default this runs from 1979 (NHL-WHA merger era floor) through the current NHL season.
+
+When a specific game, team, or player endpoint does not exist for a season (for example expansion-era teams in earlier years), 404 responses are treated as optional and skipped so the scrape can continue.
 
 Use only one source explicitly:
 
 ```bash
-python Main.py --api-source legacy
 python Main.py --api-source web
+python Main.py --api-source stats
 ```
 
 Use both sources (recommended for capture completeness):
@@ -121,7 +123,7 @@ Run a small bounded range:
 python Main.py --season 2013 --game-type 02 --start-game 1 --end-game 10
 ```
 
-Run and export legacy CSV for Tableau compatibility:
+Run and export Tableau-compatible CSV:
 
 ```bash
 python Main.py --export-csv 2018NHLShotInfoV2.csv
@@ -139,7 +141,7 @@ Useful CLI arguments:
 - `--start-season`
 - `--end-season`
 - `--game-type` (`01`, `02`, `03`, `04`)
-- `--api-source` (`legacy`, `web`, `both`)
+- `--api-source` (`web`, `stats`, `both`)
 - `--capture-edge`
 - `--capture-edge-deep`
 - `--start-game`
@@ -174,7 +176,7 @@ Idempotency behavior:
 - Rows are keyed by a deterministic event hash.
 - Re-running the same season/game range does not insert duplicate events.
 
-Legacy export fields are preserved in this order:
+Export fields are preserved in this order:
 
 - `Shot`
 - `X`
@@ -224,12 +226,12 @@ Known issues include:
 ## Data files
 
 - [2018NHLShotInfo.csv](2018NHLShotInfo.csv) - sample or earlier export data
-- [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv) - optional legacy-format export target
+- [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv) - optional Tableau-compatible export target
 
 ## Current limitations
 
 - [Scraper.py](Scraper.py) remains an unfinished prototype and will need fixes before it can be used.
-- The active scraper relies on the NHL Stats API endpoint used in the code. If the API or its game feed format changes, the script may need updates.
+- The active scraper relies on NHL Web API and NHL Stats REST endpoint formats used in the code. If those payloads change, parsing may need updates.
 
 ## Inspiration
 
