@@ -17,7 +17,6 @@ DEFAULT_START_SEASON_FALLBACK = MODERN_ERA_START_SEASON
 
 # Performance tuning defaults for long historical runs.
 DB_COMMIT_INTERVAL_GAMES = 50
-STATS_DISABLE_CHECK_GAMES = 25
 SEASON_END_PROBE_START_GAME = 900
 SEASON_END_EMPTY_STREAK_GAMES = 150
 
@@ -259,6 +258,34 @@ def fetch_season_game_numbers_from_stats(season: str, game_type: str, timeout_se
          continue
 
    return sorted(game_numbers)
+
+
+def season_has_coordinate_shots(
+   season: str,
+   game_type: str,
+   timeout_seconds: int,
+   sample_games: int = 25,
+) -> bool:
+   # Probe a sample of real game IDs to verify x/y coordinate availability for shot events.
+   game_numbers = fetch_season_game_numbers_from_stats(season, game_type, timeout_seconds)
+   if not game_numbers:
+      return False
+
+   for game_id in game_numbers[:sample_games]:
+      payload = _fetch_json_allow_404(build_web_play_by_play_url(season, game_type, game_id), timeout_seconds)
+      if not isinstance(payload, dict):
+         continue
+
+      for play in payload.get("plays", []):
+         event_key = str(play.get("typeDescKey", "")).lower()
+         if event_key not in {"goal", "shot-on-goal", "shot"}:
+            continue
+
+         details = play.get("details", {})
+         if details.get("xCoord") is not None and details.get("yCoord") is not None:
+            return True
+
+   return False
 
 
 def _player_id_from_roster_entry(player: dict) -> int | None:
@@ -852,11 +879,6 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
 
    total_games_to_check = len(game_numbers)
 
-   # If Stats REST yields zero usable rows across many checked games, stop calling it for this season.
-   stats_enabled = "stats" in active_sources
-   stats_games_checked = 0
-   stats_rows_seen = 0
-   stats_disable_threshold = STATS_DISABLE_CHECK_GAMES
    empty_game_streak = 0
 
    edge_supported = False
@@ -877,27 +899,6 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
             web_json = _fetch_json_allow_404(web_url, config.timeout_seconds)
             if web_json is not None:
                rows.extend(parse_web_shot_events(web_json, config.season, game_id))
-
-         if stats_enabled:
-            full_game_id = int(f"{config.season}{config.game_type}{game_id:04d}")
-            stats_payload = _fetch_json_allow_404(
-               build_stats_shiftcharts_url(),
-               config.timeout_seconds,
-               params={"cayenneExp": f"gameId={full_game_id}", "limit": -1},
-            )
-            if stats_payload is not None:
-               stats_rows = parse_stats_shift_events(stats_payload, config.season, game_id)
-               stats_rows_seen += len(stats_rows)
-               rows.extend(stats_rows)
-
-            stats_games_checked += 1
-            if stats_games_checked >= stats_disable_threshold and stats_rows_seen == 0:
-               logging.info(
-                  "Season %s: disabling stats source after %s checked games with 0 stats rows.",
-                  config.season,
-                  stats_games_checked,
-               )
-               stats_enabled = False
 
          if not rows:
             empty_game_streak += 1
@@ -1087,6 +1088,21 @@ def main() -> None:
          resolved_start = MODERN_ERA_START_SEASON
       logging.info("Using start season %s", resolved_start)
       seasons_to_run = season_range(resolved_start, args.end_season)
+
+   filtered_seasons = []
+   for season in seasons_to_run:
+      if season_has_coordinate_shots(season, args.game_type, args.timeout):
+         filtered_seasons.append(season)
+      else:
+         logging.info(
+            "Skipping season %s: no shot events with x/y coordinates found in sampled games.",
+            season,
+         )
+
+   seasons_to_run = filtered_seasons
+   if not seasons_to_run:
+      logging.warning("No coordinate-supported seasons found in requested range. Nothing to scrape.")
+      return
 
    total_games_processed = 0
    total_rows_inserted = 0

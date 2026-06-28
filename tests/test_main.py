@@ -52,6 +52,30 @@ class TestMainPipeline(unittest.TestCase):
 
         self.assertEqual(numbers, [1, 2, 42])
 
+    def test_season_has_coordinate_shots_true(self):
+        with patch("Main.fetch_season_game_numbers_from_stats", return_value=[1, 2, 3]):
+            with patch(
+                "Main._fetch_json_allow_404",
+                side_effect=[
+                    {"plays": [{"typeDescKey": "goal", "details": {"eventOwnerTeamId": 1}}]},
+                    {"plays": [{"typeDescKey": "shot-on-goal", "details": {"xCoord": 10, "yCoord": -5}}]},
+                ],
+            ):
+                supported = Main.season_has_coordinate_shots("2013", Main.REGULAR_SEASON, 10, sample_games=3)
+        self.assertTrue(supported)
+
+    def test_season_has_coordinate_shots_false(self):
+        with patch("Main.fetch_season_game_numbers_from_stats", return_value=[1, 2]):
+            with patch(
+                "Main._fetch_json_allow_404",
+                side_effect=[
+                    {"plays": [{"typeDescKey": "goal", "details": {"eventOwnerTeamId": 1}}]},
+                    {"plays": [{"typeDescKey": "shot", "details": {"xCoord": None, "yCoord": None}}]},
+                ],
+            ):
+                supported = Main.season_has_coordinate_shots("2013", Main.REGULAR_SEASON, 10, sample_games=2)
+        self.assertFalse(supported)
+
     def test_parse_web_shot_events(self):
         payload = {
             "homeTeam": {"abbrev": "TOR"},
