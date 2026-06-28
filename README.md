@@ -4,9 +4,9 @@ HockeyShotMap is a hockey data collection project for building shot and goal dat
 
 ## Script roles
 
-- [Main.py](Main.py) is the active NHL Stats API scraper. It loops through regular-season games, extracts shot and goal events, and appends them to [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv).
-- [Scraper.py](Scraper.py) is a separate, experimental scraper aimed at HockeyDB. It looks like a different project path from [DataCleaning.py](DataCleaning.py), not a replacement for it.
-- [DataCleaning.py](DataCleaning.py) is currently incomplete and does not run as-is.
+- [Main.py](Main.py) is the active NHL Stats API ETL pipeline.
+- [Scraper.py](Scraper.py) is a separate HockeyDB prototype and is not integrated into the active pipeline.
+- [DataCleaning.py](DataCleaning.py) contains a basic CSV loader utility for follow-on analysis work.
 
 ## What the active scraper collects
 
@@ -24,23 +24,130 @@ For each shot or goal event, [Main.py](Main.py) records:
 
 ## How [Main.py](Main.py) works
 
-The scraper builds NHL game URLs in this format:
+Pipeline flow:
+
+1. Build NHL game feed URL.
+2. Fetch game JSON from the NHL API.
+3. Parse `Goal` and `Shot` events into normalized rows.
+4. Persist rows into SQLite with duplicate-safe inserts.
+5. Optionally export legacy CSV format for visualization workflows.
+
+Game feed URL format:
 
 `https://statsapi.web.nhl.com/api/v1/game/{season}{game_type}{game_id}/feed/live`
 
 By default, the script uses:
 
-- `YEAR = "2013"`
-- regular season games only (`02`)
-- game ids from `0001` through `1271`
+- season `2013`
+- regular season game type (`02`)
+- game ids `0001` through `1271`
+- output database `hockey_shots.db`
 
-It loops through the API response, looks for `Goal` and `Shot` plays, and writes each row directly to the output CSV.
+## Setup
+
+1. Create and activate a Python environment.
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Run the scraper
+
+Default run (regular season 2013, full game range, SQLite output):
+
+```bash
+python Main.py
+```
+
+By default this runs from the earliest full season detected from NHL API endpoints through the current NHL season.
+
+Run a bounded season range:
+
+```bash
+python Main.py --start-season 2013 --end-season 2018
+```
+
+Run a single season only:
+
+```bash
+python Main.py --season 2017
+```
+
+Run a small bounded range:
+
+```bash
+python Main.py --season 2013 --game-type 02 --start-game 1 --end-game 10
+```
+
+Run and export legacy CSV for Tableau compatibility:
+
+```bash
+python Main.py --export-csv 2018NHLShotInfoV2.csv
+```
+
+Use a custom database path:
+
+```bash
+python Main.py --db-path nhl_shots_2013.db
+```
+
+Useful CLI arguments:
+
+- `--season`
+- `--start-season`
+- `--end-season`
+- `--game-type` (`01`, `02`, `03`, `04`)
+- `--start-game`
+- `--end-game`
+- `--timeout`
+- `--db-path`
+- `--export-csv`
+- `--log-level`
+
+## Storage model
+
+Primary storage is SQLite in the `shots` table.
+
+Idempotency behavior:
+
+- Rows are keyed by a deterministic event hash.
+- Re-running the same season/game range does not insert duplicate events.
+
+Legacy export fields are preserved in this order:
+
+- `Shot`
+- `X`
+- `Y`
+- `Shot_Type`
+- `Shooter`
+- `Team`
+- `Home_Away`
+- `Period`
+- `Year`
+- `GameID`
+
+## Tests
+
+Run tests with:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Current test coverage includes:
+
+- URL builder correctness
+- parser behavior with complete and partial event payloads
+- duplicate-safe persistence behavior in SQLite
 
 ## What [Scraper.py](Scraper.py) appears to do
 
 [Scraper.py](Scraper.py) imports `BeautifulSoup`, `requests`, and `numpy`, then defines functions for scraping league, team, and player pages from HockeyDB.
 
-It does not appear to be wired into the rest of the project yet, and it has several issues that would need to be fixed before it can run:
+It is intentionally kept out of the active NHL pipeline for now and still needs repair work before production use.
+
+Known issues include:
 
 - `BeautifulSoup` is being given a URL string directly instead of fetched HTML.
 - `League_Dict` is treated like a function in one place even though it is a dictionary.
@@ -50,27 +157,16 @@ It does not appear to be wired into the rest of the project yet, and it has seve
 ## Requirements
 
 - Python 3.x
-- `requests`
-- `pandas` for the cleaning script
-- `beautifulsoup4` and `numpy` for the HockeyDB scraper prototype
-
-## Running the active scraper
-
-1. Install dependencies.
-2. Open [Main.py](Main.py) and set `YEAR` to the season you want to collect.
-3. Run the script.
-
-The scraper opens [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv) in append mode, so delete or rename the file first if you want a fresh export.
+- Dependencies listed in [requirements.txt](requirements.txt)
 
 ## Data files
 
 - [2018NHLShotInfo.csv](2018NHLShotInfo.csv) - sample or earlier export data
-- [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv) - current scraper output target
+- [2018NHLShotInfoV2.csv](2018NHLShotInfoV2.csv) - optional legacy-format export target
 
 ## Current limitations
 
-- [DataCleaning.py](DataCleaning.py) is not ready to run as-is; it contains an incomplete data-loading stub and a typo in the pandas call (`pd.read.csv` should be `pd.read_csv`).
-- [Scraper.py](Scraper.py) looks like an unfinished prototype and will need fixes before it can be used.
+- [Scraper.py](Scraper.py) remains an unfinished prototype and will need fixes before it can be used.
 - The active scraper relies on the NHL Stats API endpoint used in the code. If the API or its game feed format changes, the script may need updates.
 
 ## Inspiration
