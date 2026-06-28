@@ -92,6 +92,79 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(rows[0]["Shot_Type"], "Unknown")
         self.assertEqual(rows[0]["Shooter"], "Unknown")
 
+    def test_parse_web_shot_events(self):
+        payload = {
+            "homeTeam": {"abbrev": "TOR"},
+            "awayTeam": {"abbrev": "MTL"},
+            "plays": [
+                {
+                    "typeDescKey": "goal",
+                    "periodDescriptor": {"number": 1},
+                    "details": {
+                        "xCoord": 30,
+                        "yCoord": -6,
+                        "shotType": "Wrist",
+                        "eventOwnerTeamTricode": "TOR",
+                        "scoringPlayerName": "Scorer A",
+                    },
+                },
+                {
+                    "typeDescKey": "shot-on-goal",
+                    "periodDescriptor": {"number": 2},
+                    "details": {
+                        "xCoord": -20,
+                        "yCoord": 10,
+                        "shotType": "Slap",
+                        "eventOwnerTeamTricode": "MTL",
+                        "shootingPlayerName": "Shooter B",
+                    },
+                },
+            ],
+        }
+
+        rows = Main.parse_web_shot_events(payload, "2023", 204)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["Shot"], "Goal")
+        self.assertEqual(rows[0]["API_Source"], "web")
+        self.assertEqual(rows[1]["Shot"], "ngshot")
+        self.assertEqual(rows[1]["Home_Away"], 0)
+
+    def test_roster_player_helpers(self):
+        roster_payload = {
+            "forwards": [
+                {
+                    "person": {"id": 101, "fullName": "Skater One"},
+                    "position": {"code": "C"},
+                }
+            ],
+            "goalies": [
+                {
+                    "person": {"id": 202, "fullName": "Goalie One"},
+                    "position": {"code": "G"},
+                }
+            ],
+        }
+
+        players = Main._extract_roster_players(roster_payload)
+        self.assertEqual(len(players), 2)
+        self.assertEqual(Main._player_id_from_roster_entry(players[0]), 101)
+        self.assertEqual(Main._player_position_code(players[0]), "C")
+        self.assertEqual(Main._player_position_code(players[1]), "G")
+
+    def test_edge_detail_url_builders(self):
+        self.assertEqual(
+            Main.build_web_edge_team_detail_url(9, "2024", Main.REGULAR_SEASON),
+            "https://api-web.nhle.com/v1/edge/team-detail/9/20242025/2",
+        )
+        self.assertEqual(
+            Main.build_web_edge_skater_detail_url(8482116, "2024", Main.REGULAR_SEASON),
+            "https://api-web.nhle.com/v1/edge/skater-detail/8482116/20242025/2",
+        )
+        self.assertEqual(
+            Main.build_web_edge_goalie_detail_url(8476999, "2024", Main.REGULAR_SEASON),
+            "https://api-web.nhle.com/v1/edge/goalie-detail/8476999/20242025/2",
+        )
+
     def test_persist_rows_is_idempotent(self):
         row = {
             "Shot": "Goal",
