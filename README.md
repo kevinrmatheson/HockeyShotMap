@@ -2,6 +2,8 @@
 
 HockeyShotMap is a hockey data collection project for building shot and goal datasets that can later be used for heatmaps, shooting percentage analysis, or visualization work.
 
+The project now also includes a separate read-only visualization app in [visualization/app.py](visualization/app.py) that reads the SQLite database directly and serves an interactive rink heatmap dashboard.
+
 ## Script roles
 
 - [Main.py](Main.py) is the active NHL Web API + Stats REST ETL pipeline.
@@ -16,6 +18,11 @@ For each shot or goal event, [Main.py](Main.py) records:
 - x/y rink coordinates
 - shot type
 - shooter name
+- shooter and goalie IDs when available
+- period time and remaining time
+- shot distance and angle
+- empty-net flag
+- strength state, score differential, zone, and event id
 - team tri-code
 - home/away flag
 - period
@@ -129,6 +136,16 @@ Run and export Tableau-compatible CSV:
 python Main.py --export-csv 2018NHLShotInfoV2.csv
 ```
 
+## Run the visualization app
+
+The dashboard reads the database directly, so you can open it later without rerunning the scraper.
+
+```bash
+python -m visualization.app --db-path hockey_shots.db
+```
+
+Then open the local URL printed in the terminal.
+
 Use a custom database path:
 
 ```bash
@@ -183,12 +200,24 @@ Export fields are preserved in this order:
 - `Y`
 - `Shot_Type`
 - `Shooter`
+- `Shooter_ID`
 - `Team`
 - `Home_Away`
 - `Period`
+- `Period_Time`
+- `Period_Time_Remaining`
 - `Year`
 - `GameID`
 - `API_Source`
+- `Goalie`
+- `Goalie_ID`
+- `Shot_Distance`
+- `Shot_Angle`
+- `Is_Empty_Net`
+- `Strength_State`
+- `Score_Differential`
+- `Zone`
+- `Event_ID`
 
 ## Tests
 
@@ -232,7 +261,3 @@ Known issues include:
 
 - [Scraper.py](Scraper.py) remains an unfinished prototype and will need fixes before it can be used.
 - The active scraper relies on NHL Web API and NHL Stats REST endpoint formats used in the code. If those payloads change, parsing may need updates.
-
-## Inspiration
-
-This project was inspired by https://github.com/tomljr2/ShootingPercentageByDistance/blob/master/shootingpercentage.py.

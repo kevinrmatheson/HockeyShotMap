@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+   <meta charset="utf-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1">
+   <title>HockeyShotMap Heatmap</title>
+   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+   <main class="app-shell" data-db-path="{{ db_path }}" data-latest-season="{{ latest_season }}">
+      <section class="hero">
+         <div>
+            <p class="eyebrow">HockeyShotMap</p>
+            <h1>Shot Heatmap Dashboard</h1>
+            <p class="hero-copy">
+               Explore where shots come from, toggle shot density versus goal percentage, and filter by season,
+               team, strength state, player, and game context.
+            </p>
+         </div>
+         <div class="status-card">
+            <span class="status-dot"></span>
+            <div>
+               <strong>Live SQLite view</strong>
+               <p id="db-path-label">{{ db_path }}</p>
+            </div>
+         </div>
+      </section>
+
+      <section class="controls-panel">
+         <div class="control-grid">
+            <label>
+               <span>Season</span>
+               <select id="season-filter"></select>
+            </label>
+            <label>
+               <span>Team</span>
+               <select id="team-filter"></select>
+            </label>
+            <label>
+               <span>Player</span>
+               <input id="player-filter" type="search" list="player-options" placeholder="Type a player name">
+               <datalist id="player-options"></datalist>
+            </label>
+            <label>
+               <span>Strength state</span>
+               <select id="strength-filter"></select>
+            </label>
+            <label>
+               <span>Shot result</span>
+               <select id="shot-result-filter"></select>
+            </label>
+            <label>
+               <span>Home/Away</span>
+               <select id="home-away-filter"></select>
+            </label>
+            <label>
+               <span>Period</span>
+               <select id="period-filter"></select>
+            </label>
+         </div>
+
+         <div class="action-row">
+            <div class="mode-toggle" role="tablist" aria-label="Heatmap mode">
+               <button id="density-mode" class="mode-button is-active" type="button">Shot density</button>
+               <button id="goal-pct-mode" class="mode-button" type="button">Goal percentage</button>
+            </div>
+            <div class="action-buttons">
+               <button id="copy-link-button" class="ghost-button" type="button">Copy share link</button>
+               <button id="reset-button" class="ghost-button" type="button">Reset filters</button>
+            </div>
+         </div>
+      </section>
+
+      <section class="summary-grid">
+         <article class="summary-card">
+            <span class="summary-label">Shots</span>
+            <strong id="shot-count">0</strong>
+         </article>
+         <article class="summary-card">
+            <span class="summary-label">Goals</span>
+            <strong id="goal-count">0</strong>
+         </article>
+         <article class="summary-card">
+            <span class="summary-label">Goal rate</span>
+            <strong id="goal-pct">0.0%</strong>
+         </article>
+         <article class="summary-card">
+            <span class="summary-label">Bins</span>
+            <strong id="bin-count">0</strong>
+         </article>
+      </section>
+
+      <section class="viz-panel">
+         <header class="viz-header">
+            <div>
+               <p class="eyebrow">Rink view</p>
+               <h2 id="viz-title">Shot density</h2>
+            </div>
+            <div class="legend">
+               <span class="legend-key density-key">Hotter = more shots</span>
+               <span class="legend-key pct-key">Hotter = higher goal percentage</span>
+            </div>
+         </header>
+
+         <div class="rink-stage" id="rink-stage">
+            <img class="rink-image" src="{{ url_for('static', filename='assets/rink.svg') }}" alt="Hockey rink diagram">
+            <canvas id="heatmap-canvas" aria-label="Shot heatmap overlay"></canvas>
+            <div id="heatmap-tooltip" class="heatmap-tooltip" hidden></div>
+         </div>
+      </section>
+   </main>
+
+   <script>
+      window.__APP_CONFIG__ = {
+         latestSeason: "{{ latest_season }}",
+      };
+   </script>
+   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

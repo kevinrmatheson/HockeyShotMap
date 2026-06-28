@@ -83,24 +83,46 @@ class TestMainPipeline(unittest.TestCase):
             "plays": [
                 {
                     "typeDescKey": "goal",
+                    "eventId": 101,
                     "periodDescriptor": {"number": 1},
+                    "about": {"periodTime": "12:34", "periodTimeRemaining": "07:26", "period": 1},
                     "details": {
                         "xCoord": 30,
                         "yCoord": -6,
                         "shotType": "Wrist",
                         "eventOwnerTeamTricode": "TOR",
                         "scoringPlayerName": "Scorer A",
+                        "scoringPlayerId": 11,
+                        "goalieInNetName": "Goalie X",
+                        "goalieInNetId": 41,
+                        "shotDistance": 18.4,
+                        "shotAngle": 22.1,
+                        "emptyNet": False,
+                        "situationCode": "5v5",
+                        "scoreDifferential": 0,
+                        "zoneCode": "OZ",
                     },
                 },
                 {
                     "typeDescKey": "shot-on-goal",
+                    "eventId": 102,
                     "periodDescriptor": {"number": 2},
+                    "about": {"periodTime": "03:21", "periodTimeRemaining": "16:39", "period": 2},
                     "details": {
                         "xCoord": -20,
                         "yCoord": 10,
                         "shotType": "Slap",
                         "eventOwnerTeamTricode": "MTL",
                         "shootingPlayerName": "Shooter B",
+                        "shootingPlayerId": 22,
+                        "goalieInNetName": "Goalie Y",
+                        "goalieInNetId": 42,
+                        "shotDistance": 31.0,
+                        "shotAngle": 35.5,
+                        "isEmptyNet": 0,
+                        "strength": "5v4",
+                        "goalDifferential": -1,
+                        "zone": "DZ",
                     },
                 },
             ],
@@ -110,8 +132,17 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["Shot"], "Goal")
         self.assertEqual(rows[0]["API_Source"], "web")
+        self.assertEqual(rows[0]["Shooter_ID"], 11)
+        self.assertEqual(rows[0]["Goalie"], "Goalie X")
+        self.assertEqual(rows[0]["Period_Time"], "12:34")
+        self.assertEqual(rows[0]["Strength_State"], "5v5")
+        self.assertEqual(rows[0]["Event_ID"], 101)
         self.assertEqual(rows[1]["Shot"], "ngshot")
         self.assertEqual(rows[1]["Home_Away"], 0)
+        self.assertEqual(rows[1]["Goalie_ID"], 42)
+        self.assertEqual(rows[1]["Is_Empty_Net"], 0)
+        self.assertEqual(rows[1]["Score_Differential"], -1)
+        self.assertEqual(rows[1]["Zone"], "DZ")
 
     def test_roster_player_helpers(self):
         roster_payload = {
@@ -300,6 +331,29 @@ class TestMainPipeline(unittest.TestCase):
         with patch.object(Main._HTTP_SESSION, "get", side_effect=requests.RequestException("network down")):
             earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
         self.assertEqual(earliest, Main.DEFAULT_START_SEASON_FALLBACK)
+
+    def test_run_state_helpers_skip_completed_range(self):
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_runstate_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        with sqlite3.connect(db_path) as connection:
+            cursor = connection.cursor()
+            Main._upsert_run_state(
+                cursor,
+                "2024",
+                Main.REGULAR_SEASON,
+                1,
+                10,
+                10,
+                10,
+                100,
+                "complete",
+            )
+            connection.commit()
+
+        self.assertTrue(Main._season_run_is_complete(db_path, "2024", Main.REGULAR_SEASON, 1, 10))
+        self.assertEqual(Main._resume_start_game(db_path, "2024", Main.REGULAR_SEASON, 1, 10), 11)
+        self.assertFalse(Main._season_run_is_complete(db_path, "2024", Main.REGULAR_SEASON, 1, 11))
 
 
 if __name__ == "__main__":

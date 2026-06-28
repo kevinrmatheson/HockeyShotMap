@@ -4,10 +4,15 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from dataclasses import dataclass
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 STATS_REST_BASE_URL = "https://api.nhle.com/stats/rest"
@@ -19,6 +24,11 @@ DEFAULT_START_SEASON_FALLBACK = MODERN_ERA_START_SEASON
 DB_COMMIT_INTERVAL_GAMES = 50
 SEASON_END_PROBE_START_GAME = 900
 SEASON_END_EMPTY_STREAK_GAMES = 150
+DEFAULT_MAX_WORKERS = 4
+DEFAULT_REQUEST_DELAY_SECONDS = 0.15
+HTTP_RETRY_TOTAL = 5
+HTTP_RETRY_BACKOFF_FACTOR = 0.6
+HTTP_RATE_LIMIT_STATUSES = {429, 500, 502, 503, 504}
 
 # Supported NHL game type codes from the stats API.
 PRESEASON = "01"
@@ -33,16 +43,91 @@ CSV_FIELDNAMES = [
    "Y",
    "Shot_Type",
    "Shooter",
+   "Shooter_ID",
    "Team",
    "Home_Away",
    "Period",
+   "Period_Time",
+   "Period_Time_Remaining",
    "Year",
    "GameID",
    "API_Source",
+   "Goalie",
+   "Goalie_ID",
+   "Shot_Distance",
+   "Shot_Angle",
+   "Is_Empty_Net",
+   "Strength_State",
+   "Score_Differential",
+   "Zone",
+   "Event_ID",
 ]
 
 
 _HTTP_SESSION = requests.Session()
+_THREAD_LOCAL = threading.local()
+
+
+def _build_retry_adapter() -> HTTPAdapter:
+   retry = Retry(
+      total=HTTP_RETRY_TOTAL,
+      connect=HTTP_RETRY_TOTAL,
+      read=HTTP_RETRY_TOTAL,
+      status=HTTP_RETRY_TOTAL,
+      backoff_factor=HTTP_RETRY_BACKOFF_FACTOR,
+      status_forcelist=HTTP_RATE_LIMIT_STATUSES,
+      allowed_methods=frozenset({"GET"}),
+      raise_on_status=False,
+   )
+   return HTTPAdapter(max_retries=retry, pool_connections=DEFAULT_MAX_WORKERS * 2, pool_maxsize=DEFAULT_MAX_WORKERS * 2)
+
+
+_HTTP_SESSION.mount("http://", _build_retry_adapter())
+_HTTP_SESSION.mount("https://", _build_retry_adapter())
+
+
+class _RequestRateLimiter:
+   def __init__(self, minimum_interval_seconds: float) -> None:
+      self.minimum_interval_seconds = max(0.0, minimum_interval_seconds)
+      self._lock = threading.Lock()
+      self._next_allowed_time = 0.0
+
+   def acquire(self) -> None:
+      if self.minimum_interval_seconds <= 0:
+         return
+
+      with self._lock:
+         now = time.monotonic()
+         if now < self._next_allowed_time:
+            sleep_seconds = self._next_allowed_time - now
+            self._next_allowed_time += self.minimum_interval_seconds
+         else:
+            sleep_seconds = 0.0
+            self._next_allowed_time = now + self.minimum_interval_seconds
+
+      if sleep_seconds > 0:
+         time.sleep(sleep_seconds)
+
+
+_REQUEST_RATE_LIMITER = _RequestRateLimiter(DEFAULT_REQUEST_DELAY_SECONDS)
+
+
+def configure_request_rate_limit(minimum_interval_seconds: float) -> None:
+   _REQUEST_RATE_LIMITER.minimum_interval_seconds = max(0.0, minimum_interval_seconds)
+
+
+def _get_http_session() -> requests.Session:
+   if threading.current_thread() is threading.main_thread():
+      return _HTTP_SESSION
+
+   session = getattr(_THREAD_LOCAL, "session", None)
+   if session is None:
+      session = requests.Session()
+      adapter = _build_retry_adapter()
+      session.mount("http://", adapter)
+      session.mount("https://", adapter)
+      _THREAD_LOCAL.session = session
+   return session
 
 
 @dataclass
@@ -53,6 +138,8 @@ class ScrapeConfig:
    start_game: int = 1
    end_game: int = 1271
    timeout_seconds: int = 10
+   max_workers: int = DEFAULT_MAX_WORKERS
+   request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS
    db_path: str = "hockey_shots.db"
    export_csv: str | None = None
 
@@ -73,7 +160,8 @@ def build_web_play_by_play_url(season: str, game_type: str, game_id: int) -> str
 
 def _fetch_json(url: str, timeout_seconds: int, params: dict | None = None) -> dict | None:
    try:
-      response = _HTTP_SESSION.get(url, timeout=timeout_seconds, params=params)
+      _REQUEST_RATE_LIMITER.acquire()
+      response = _get_http_session().get(url, timeout=timeout_seconds, params=params)
       response.raise_for_status()
       return response.json()
    except (requests.RequestException, ValueError) as exc:
@@ -84,7 +172,8 @@ def _fetch_json(url: str, timeout_seconds: int, params: dict | None = None) -> d
 def _fetch_json_allow_404(url: str, timeout_seconds: int, params: dict | None = None) -> dict | None:
    # Some Edge endpoints are intermittently unavailable for certain seasons; treat 404 as optional.
    try:
-      response = _HTTP_SESSION.get(url, timeout=timeout_seconds, params=params)
+      _REQUEST_RATE_LIMITER.acquire()
+      response = _get_http_session().get(url, timeout=timeout_seconds, params=params)
       if response.status_code == 404:
          logging.info("Optional endpoint unavailable (404): %s", url)
          return None
@@ -146,6 +235,71 @@ def _home_away_value(team_code: str | None, home_code: str | None, away_code: st
    if team_code and home_code and team_code == home_code:
       return 1
    if team_code and away_code and team_code == away_code:
+      return 0
+   return None
+
+
+def _first_non_none(*values: object) -> object | None:
+   for value in values:
+      if value is not None:
+         return value
+   return None
+
+
+def _normalize_text(value: object | None) -> str | None:
+   if value is None:
+      return None
+   text = str(value).strip()
+   return text or None
+
+
+def _coerce_int(value: object | None) -> int | None:
+   if value is None:
+      return None
+   if isinstance(value, bool):
+      return int(value)
+   if isinstance(value, int):
+      return value
+   if isinstance(value, float):
+      return int(value)
+   text = str(value).strip()
+   if not text:
+      return None
+   try:
+      return int(float(text))
+   except (TypeError, ValueError):
+      return None
+
+
+def _coerce_float(value: object | None) -> float | None:
+   if value is None:
+      return None
+   if isinstance(value, bool):
+      return float(int(value))
+   if isinstance(value, (int, float)):
+      return float(value)
+   text = str(value).strip()
+   if not text:
+      return None
+   try:
+      return float(text)
+   except (TypeError, ValueError):
+      return None
+
+
+def _coerce_bool_int(value: object | None) -> int | None:
+   if value is None:
+      return None
+   if isinstance(value, bool):
+      return int(value)
+   if isinstance(value, (int, float)):
+      return 1 if float(value) != 0 else 0
+   text = str(value).strip().lower()
+   if not text:
+      return None
+   if text in {"true", "t", "yes", "y", "1"}:
+      return 1
+   if text in {"false", "f", "no", "n", "0"}:
       return 0
    return None
 
@@ -379,6 +533,8 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
          continue
 
       details = play.get("details", {})
+      about = play.get("about", {})
+      period_descriptor = play.get("periodDescriptor", {})
       x_coord = details.get("xCoord")
       y_coord = details.get("yCoord")
       if x_coord is None or y_coord is None:
@@ -396,12 +552,21 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
          or (team_id_to_code.get(owner_team_id) if owner_team_id is not None else None)
          or play.get("team", {}).get("triCode")
       )
-      shot_type = details.get("shotType") or details.get("secondaryType") or "Unknown"
-      shooter = details.get("shootingPlayerName") or details.get("scoringPlayerName") or "Unknown"
-      period = (
-         play.get("periodDescriptor", {}).get("number")
-         or play.get("about", {}).get("period")
-      )
+      shot_type = _normalize_text(_first_non_none(details.get("shotType"), details.get("secondaryType"))) or "Unknown"
+      shooter = _normalize_text(_first_non_none(details.get("shootingPlayerName"), details.get("scoringPlayerName"))) or "Unknown"
+      shooter_id = _coerce_int(_first_non_none(details.get("shootingPlayerId"), details.get("scoringPlayerId"), details.get("playerId")))
+      goalie = _normalize_text(_first_non_none(details.get("goalieInNetName"), details.get("goalieName")))
+      goalie_id = _coerce_int(_first_non_none(details.get("goalieInNetId"), details.get("goalieId")))
+      period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
+      period_time = _normalize_text(_first_non_none(about.get("periodTime"), play.get("periodTime")))
+      period_time_remaining = _normalize_text(_first_non_none(about.get("periodTimeRemaining"), play.get("periodTimeRemaining")))
+      shot_distance = _coerce_float(_first_non_none(details.get("shotDistance"), details.get("distanceFromNet"), details.get("distance")))
+      shot_angle = _coerce_float(_first_non_none(details.get("shotAngle"), details.get("angleFromNet"), details.get("angle")))
+      is_empty_net = _coerce_bool_int(_first_non_none(details.get("emptyNet"), details.get("isEmptyNet"), details.get("empty_net")))
+      strength_state = _normalize_text(_first_non_none(details.get("strength"), details.get("situationCode"), play.get("situationCode")))
+      score_differential = _coerce_int(_first_non_none(details.get("scoreDifferential"), details.get("goalDifferential"), play.get("scoreDifferential")))
+      zone = _normalize_text(_first_non_none(details.get("zone"), details.get("zoneCode"), play.get("zone"), play.get("zoneCode")))
+      event_id = _coerce_int(_first_non_none(play.get("eventId"), details.get("eventId")))
 
       rows.append(
          {
@@ -410,12 +575,24 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
             "Y": float(y_coord),
             "Shot_Type": shot_type,
             "Shooter": shooter,
+            "Shooter_ID": shooter_id,
             "Team": team_code,
             "Home_Away": _home_away_value(team_code, home_code, away_code),
             "Period": period,
+            "Period_Time": period_time,
+            "Period_Time_Remaining": period_time_remaining,
             "Year": season,
             "GameID": game_id,
             "API_Source": "web",
+            "Goalie": goalie,
+            "Goalie_ID": goalie_id,
+            "Shot_Distance": shot_distance,
+            "Shot_Angle": shot_angle,
+            "Is_Empty_Net": is_empty_net,
+            "Strength_State": strength_state,
+            "Score_Differential": score_differential,
+            "Zone": zone,
+            "Event_ID": event_id,
          }
       )
 
@@ -492,12 +669,24 @@ def initialize_database(db_path: str) -> None:
             y REAL NOT NULL,
             shot_type TEXT,
             shooter TEXT,
+            shooter_id INTEGER,
             team TEXT,
             home_away INTEGER,
             period INTEGER,
+            period_time TEXT,
+            period_time_remaining TEXT,
             season TEXT NOT NULL,
             game_id INTEGER NOT NULL,
-            api_source TEXT NOT NULL DEFAULT 'web'
+            api_source TEXT NOT NULL DEFAULT 'web',
+            goalie TEXT,
+            goalie_id INTEGER,
+            shot_distance REAL,
+            shot_angle REAL,
+            is_empty_net INTEGER,
+            strength_state TEXT,
+            score_differential INTEGER,
+            zone TEXT,
+            event_id INTEGER
          )
          """
       )
@@ -506,6 +695,38 @@ def initialize_database(db_path: str) -> None:
       columns = {row[1] for row in cursor.fetchall()}
       if "api_source" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN api_source TEXT NOT NULL DEFAULT 'web'")
+      if "shooter_id" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN shooter_id INTEGER")
+      if "period_time" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN period_time TEXT")
+      if "period_time_remaining" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN period_time_remaining TEXT")
+      if "goalie" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN goalie TEXT")
+      if "goalie_id" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN goalie_id INTEGER")
+      if "shot_distance" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN shot_distance REAL")
+      if "shot_angle" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN shot_angle REAL")
+      if "is_empty_net" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN is_empty_net INTEGER")
+      if "strength_state" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN strength_state TEXT")
+      if "score_differential" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN score_differential INTEGER")
+      if "zone" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN zone TEXT")
+      if "event_id" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN event_id INTEGER")
+
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_season ON shots(season)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_team ON shots(team)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_shooter ON shots(shooter)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_strength_state ON shots(strength_state)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_shot_result ON shots(shot_result)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_period ON shots(period)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_home_away ON shots(home_away)")
 
       cursor.execute(
          """
@@ -539,7 +760,229 @@ def initialize_database(db_path: str) -> None:
          )
          """
       )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS edge_metric_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            season TEXT NOT NULL,
+            game_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            snapshot_type TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            metric_path TEXT NOT NULL,
+            metric_value_text TEXT,
+            metric_value_numeric REAL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE(season, game_type, source, snapshot_type, entity_type, entity_id, endpoint, metric_path)
+         )
+         """
+      )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS season_scrape_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            season TEXT NOT NULL,
+            game_type TEXT NOT NULL,
+            start_game INTEGER NOT NULL,
+            end_game INTEGER NOT NULL,
+            completed_through_game INTEGER NOT NULL DEFAULT 0,
+            games_processed INTEGER NOT NULL DEFAULT 0,
+            rows_inserted INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'running',
+            updated_at TEXT NOT NULL,
+            UNIQUE(season, game_type, start_game, end_game)
+         )
+         """
+      )
       connection.commit()
+
+
+def _flatten_json_scalars(value: object, prefix: str = "") -> list[tuple[str, object]]:
+   flattened: list[tuple[str, object]] = []
+
+   if isinstance(value, dict):
+      for key, nested_value in value.items():
+         path = f"{prefix}.{key}" if prefix else str(key)
+         flattened.extend(_flatten_json_scalars(nested_value, path))
+      return flattened
+
+   if isinstance(value, list):
+      for index, nested_value in enumerate(value):
+         path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+         flattened.extend(_flatten_json_scalars(nested_value, path))
+      return flattened
+
+   if prefix:
+      flattened.append((prefix, value))
+   return flattened
+
+
+def _metric_value_parts(value: object) -> tuple[str | None, float | None]:
+   if value is None:
+      return None, None
+   if isinstance(value, bool):
+      return str(int(value)), float(int(value))
+   if isinstance(value, (int, float)):
+      return str(value), float(value)
+
+   text = str(value)
+   try:
+      numeric = float(text)
+   except (TypeError, ValueError):
+      numeric = None
+   return text, numeric
+
+
+def _store_edge_metric_values(
+   cursor: sqlite3.Cursor,
+   season: str,
+   game_type: str,
+   source: str,
+   snapshot_type: str,
+   entity_type: str,
+   entity_id: str,
+   endpoint: str,
+   payload: dict | list,
+) -> int:
+   fetched_at = datetime.now(UTC).isoformat(timespec="seconds")
+   metric_rows = []
+   for metric_path, metric_value in _flatten_json_scalars(payload):
+      value_text, value_numeric = _metric_value_parts(metric_value)
+      metric_rows.append(
+         (
+            season,
+            game_type,
+            source,
+            snapshot_type,
+            entity_type,
+            str(entity_id),
+            endpoint,
+            metric_path,
+            value_text,
+            value_numeric,
+            fetched_at,
+         )
+      )
+
+   if not metric_rows:
+      return 0
+
+   cursor.executemany(
+      """
+      INSERT OR REPLACE INTO edge_metric_values
+      (season, game_type, source, snapshot_type, entity_type, entity_id, endpoint, metric_path,
+       metric_value_text, metric_value_numeric, fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      metric_rows,
+   )
+   return len(metric_rows)
+
+
+def _run_state_key(season: str, game_type: str, start_game: int, end_game: int) -> tuple[str, str, int, int]:
+   return season, str(game_type), start_game, end_game
+
+
+def _load_completed_run(db_path: str, season: str, game_type: str, start_game: int, end_game: int) -> dict | None:
+   try:
+      with sqlite3.connect(db_path) as connection:
+         connection.row_factory = sqlite3.Row
+         row = connection.execute(
+            """
+            SELECT *
+            FROM season_scrape_runs
+            WHERE season = ? AND game_type = ? AND start_game = ? AND end_game = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            _run_state_key(season, game_type, start_game, end_game),
+         ).fetchone()
+   except sqlite3.OperationalError:
+      return None
+   return dict(row) if row is not None else None
+
+
+def _upsert_run_state(
+   cursor: sqlite3.Cursor,
+   season: str,
+   game_type: str,
+   start_game: int,
+   end_game: int,
+   completed_through_game: int,
+   games_processed: int,
+   rows_inserted: int,
+   status: str,
+) -> None:
+   updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+   cursor.execute(
+      """
+      INSERT INTO season_scrape_runs
+      (season, game_type, start_game, end_game, completed_through_game, games_processed, rows_inserted, status, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(season, game_type, start_game, end_game)
+      DO UPDATE SET
+         completed_through_game = excluded.completed_through_game,
+         games_processed = excluded.games_processed,
+         rows_inserted = excluded.rows_inserted,
+         status = excluded.status,
+         updated_at = excluded.updated_at
+      """,
+      (season, game_type, start_game, end_game, completed_through_game, games_processed, rows_inserted, status, updated_at),
+   )
+
+
+def _season_run_is_complete(db_path: str, season: str, game_type: str, start_game: int, end_game: int) -> bool:
+   run_state = _load_completed_run(db_path, season, game_type, start_game, end_game)
+   if not run_state:
+      return False
+   return run_state.get("status") == "complete" and int(run_state.get("completed_through_game") or 0) >= end_game
+
+
+def _resume_start_game(db_path: str, season: str, game_type: str, start_game: int, end_game: int) -> int:
+   run_state = _load_completed_run(db_path, season, game_type, start_game, end_game)
+   if not run_state:
+      return start_game
+
+   completed_through = int(run_state.get("completed_through_game") or 0)
+   if run_state.get("status") == "complete" and completed_through >= end_game:
+      return end_game + 1
+
+   return max(start_game, completed_through + 1)
+
+
+def _fetch_and_parse_game_rows(season: str, game_type: str, game_id: int, timeout_seconds: int, api_sources: list[str]) -> list[dict]:
+   rows: list[dict] = []
+   if "web" in api_sources:
+      web_url = build_web_play_by_play_url(season, game_type, game_id)
+      web_json = _fetch_json_allow_404(web_url, timeout_seconds)
+      if web_json is not None:
+         rows.extend(parse_web_shot_events(web_json, season, game_id))
+   return rows
+
+
+def _iter_game_rows_parallel(
+   season: str,
+   game_type: str,
+   game_numbers: list[int],
+   timeout_seconds: int,
+   active_sources: list[str],
+   max_workers: int,
+) -> list[tuple[int, list[dict]]]:
+   if max_workers <= 1 or len(game_numbers) <= 1:
+      return [(game_id, _fetch_and_parse_game_rows(season, game_type, game_id, timeout_seconds, active_sources)) for game_id in game_numbers]
+
+   results: list[tuple[int, list[dict]]] = []
+   batch_size = max(1, max_workers * 4)
+   for batch_start in range(0, len(game_numbers), batch_size):
+      batch = game_numbers[batch_start : batch_start + batch_size]
+      with ThreadPoolExecutor(max_workers=max_workers) as executor:
+         for game_id, rows in zip(batch, executor.map(lambda gid: _fetch_and_parse_game_rows(season, game_type, gid, timeout_seconds, active_sources), batch)):
+            results.append((game_id, rows))
+   return results
 
 
 def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
@@ -554,12 +997,24 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          row["Y"],
          row["Shot_Type"],
          row["Shooter"],
+         row.get("Shooter_ID"),
          row["Team"],
          row["Home_Away"],
          row["Period"],
+         row.get("Period_Time"),
+         row.get("Period_Time_Remaining"),
          row["Year"],
          row["GameID"],
          row.get("API_Source", "web"),
+         row.get("Goalie"),
+         row.get("Goalie_ID"),
+         row.get("Shot_Distance"),
+         row.get("Shot_Angle"),
+         row.get("Is_Empty_Net"),
+         row.get("Strength_State"),
+         row.get("Score_Differential"),
+         row.get("Zone"),
+         row.get("Event_ID"),
       )
       for row in rows
    ]
@@ -568,9 +1023,11 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
    cursor.executemany(
       """
       INSERT OR IGNORE INTO shots (
-         event_hash, shot_result, x, y, shot_type, shooter, team,
-         home_away, period, season, game_id, api_source
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         event_hash, shot_result, x, y, shot_type, shooter, shooter_id, team,
+         home_away, period, period_time, period_time_remaining, season, game_id, api_source,
+         goalie, goalie_id, shot_distance, shot_angle, is_empty_net, strength_state,
+         score_differential, zone, event_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       """,
       params,
    )
@@ -595,7 +1052,9 @@ def export_to_csv(db_path: str, csv_path: str) -> int:
       cursor = connection.cursor()
       cursor.execute(
          """
-         SELECT shot_result, x, y, shot_type, shooter, team, home_away, period, season, game_id, api_source
+         SELECT shot_result, x, y, shot_type, shooter, shooter_id, team, home_away, period, period_time,
+                period_time_remaining, season, game_id, api_source, goalie, goalie_id, shot_distance,
+                shot_angle, is_empty_net, strength_state, score_differential, zone, event_id
          FROM shots
          ORDER BY season, game_id, id
          """
@@ -613,12 +1072,24 @@ def export_to_csv(db_path: str, csv_path: str) -> int:
                "Y": row[2],
                "Shot_Type": row[3],
                "Shooter": row[4],
-               "Team": row[5],
-               "Home_Away": row[6],
-               "Period": row[7],
-               "Year": row[8],
-               "GameID": row[9],
-               "API_Source": row[10],
+               "Shooter_ID": row[5],
+               "Team": row[6],
+               "Home_Away": row[7],
+               "Period": row[8],
+               "Period_Time": row[9],
+               "Period_Time_Remaining": row[10],
+               "Year": row[11],
+               "GameID": row[12],
+               "API_Source": row[13],
+               "Goalie": row[14],
+               "Goalie_ID": row[15],
+               "Shot_Distance": row[16],
+               "Shot_Angle": row[17],
+               "Is_Empty_Net": row[18],
+               "Strength_State": row[19],
+               "Score_Differential": row[20],
+               "Zone": row[21],
+               "Event_ID": row[22],
             }
          )
    return len(rows)
@@ -662,6 +1133,17 @@ def capture_edge_summary_snapshots(db_path: str, season: str, game_type: str, ti
                fetched_at,
             ),
          )
+         _store_edge_metric_values(
+            cursor,
+            season,
+            edge_game_type,
+            "web",
+            "summary",
+            "season",
+            season_id,
+            endpoint,
+            payload,
+         )
          inserted += 1
 
       for endpoint in optional_endpoints:
@@ -682,6 +1164,17 @@ def capture_edge_summary_snapshots(db_path: str, season: str, game_type: str, ti
                json.dumps(payload),
                fetched_at,
             ),
+         )
+         _store_edge_metric_values(
+            cursor,
+            season,
+            edge_game_type,
+            "web",
+            "summary",
+            "season",
+            season_id,
+            endpoint,
+            payload,
          )
          inserted += 1
       connection.commit()
@@ -793,6 +1286,17 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
                team_detail_payload,
                cursor,
             )
+            _store_edge_metric_values(
+               cursor,
+               season,
+               edge_game_type,
+               "web",
+               "team-detail",
+               "team",
+               str(team_id),
+               team_detail_endpoint,
+               team_detail_payload,
+            )
             total_snapshots += 1
 
          roster_endpoint = build_web_roster_url(team_code, season)
@@ -811,6 +1315,17 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
             roster_endpoint,
             roster_payload,
             cursor,
+         )
+         _store_edge_metric_values(
+            cursor,
+            season,
+            edge_game_type,
+            "web",
+            "roster",
+            "team",
+            team_code,
+            roster_endpoint,
+            roster_payload,
          )
          total_snapshots += 1
 
@@ -845,6 +1360,17 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
                player_payload,
                cursor,
             )
+            _store_edge_metric_values(
+               cursor,
+               season,
+               edge_game_type,
+               "web",
+               snapshot_type,
+               "player",
+               str(player_id),
+               player_endpoint,
+               player_payload,
+            )
             total_snapshots += 1
 
       connection.commit()
@@ -855,17 +1381,39 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
 def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int, int, int]:
    # Orchestrates fetch -> parse -> persist for a game range.
    initialize_database(config.db_path)
+   configure_request_rate_limit(config.request_delay_seconds)
 
    games_processed = 0
    rows_inserted = 0
    edge_payloads_inserted = 0
    edge_detail_payloads_inserted = 0
    team_codes_seen: set[str] = set()
-   game_numbers = list(range(config.start_game, config.end_game + 1))
+   if _season_run_is_complete(config.db_path, config.season, config.game_type, config.start_game, config.end_game):
+      logging.info(
+         "Season %s game_type %s range %s-%s already completed in the database; skipping scrape.",
+         config.season,
+         config.game_type,
+         config.start_game,
+         config.end_game,
+      )
+      return 0, 0, 0, 0
+
+   resume_start_game = _resume_start_game(config.db_path, config.season, config.game_type, config.start_game, config.end_game)
+   if resume_start_game > config.end_game:
+      logging.info(
+         "Season %s game_type %s range %s-%s already present; nothing to do.",
+         config.season,
+         config.game_type,
+         config.start_game,
+         config.end_game,
+      )
+      return 0, 0, 0, 0
+
+   game_numbers = list(range(resume_start_game, config.end_game + 1))
    if "stats" in active_sources:
       manifest_numbers = fetch_season_game_numbers_from_stats(config.season, config.game_type, config.timeout_seconds)
       if manifest_numbers:
-         game_numbers = [n for n in manifest_numbers if config.start_game <= n <= config.end_game]
+         game_numbers = [n for n in manifest_numbers if resume_start_game <= n <= config.end_game]
          logging.info(
             "Season %s: loaded %s game numbers from stats manifest (range-filtered).",
             config.season,
@@ -889,70 +1437,137 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
 
    with sqlite3.connect(config.db_path) as connection:
       cursor = connection.cursor()
+      completed_through_game = resume_start_game - 1
+      completed_normally = True
 
-      for index, game_id in enumerate(game_numbers, start=1):
-         rows = []
-         game_index = index
+      try:
+         for index, (game_id, rows) in enumerate(
+            _iter_game_rows_parallel(
+               config.season,
+               config.game_type,
+               game_numbers,
+               config.timeout_seconds,
+               active_sources,
+               config.max_workers,
+            ),
+            start=1,
+         ):
+            if not rows:
+               empty_game_streak += 1
+               if index % 50 == 0 or index == total_games_to_check:
+                  logging.info(
+                     "Season %s progress: checked %s/%s games, games_with_rows=%s, rows_inserted=%s",
+                     config.season,
+                     index,
+                     total_games_to_check,
+                     games_processed,
+                     rows_inserted,
+                  )
 
-         if "web" in active_sources:
-            web_url = build_web_play_by_play_url(config.season, config.game_type, game_id)
-            web_json = _fetch_json_allow_404(web_url, config.timeout_seconds)
-            if web_json is not None:
-               rows.extend(parse_web_shot_events(web_json, config.season, game_id))
+               if game_id >= SEASON_END_PROBE_START_GAME and empty_game_streak >= SEASON_END_EMPTY_STREAK_GAMES:
+                  logging.info(
+                     "Season %s: stopping early at game %s after %s consecutive empty games.",
+                     config.season,
+                     game_id,
+                     empty_game_streak,
+                  )
+                  completed_normally = False
+                  _upsert_run_state(
+                     cursor,
+                     config.season,
+                     config.game_type,
+                     config.start_game,
+                     config.end_game,
+                     completed_through_game,
+                     games_processed,
+                     rows_inserted,
+                     "partial",
+                  )
+                  connection.commit()
+                  break
+               if index % DB_COMMIT_INTERVAL_GAMES == 0:
+                  _upsert_run_state(
+                     cursor,
+                     config.season,
+                     config.game_type,
+                     config.start_game,
+                     config.end_game,
+                     game_id,
+                     games_processed,
+                     rows_inserted,
+                     "running",
+                  )
+                  connection.commit()
+               continue
 
-         if not rows:
-            empty_game_streak += 1
-            if game_index % 50 == 0 or game_index == total_games_to_check:
+            empty_game_streak = 0
+            completed_through_game = game_id
+            inserted = _persist_rows_with_cursor(cursor, rows)
+            games_processed += 1
+            rows_inserted += inserted
+            if capture_edge_deep:
+               for row in rows:
+                  team_code = row.get("Team")
+                  if team_code:
+                     team_codes_seen.add(str(team_code).upper())
+
+            logging.info(
+               "Game %s parsed rows=%s inserted=%s",
+               game_id,
+               len(rows),
+               inserted,
+            )
+
+            if index % DB_COMMIT_INTERVAL_GAMES == 0:
+               _upsert_run_state(
+                  cursor,
+                  config.season,
+                  config.game_type,
+                  config.start_game,
+                  config.end_game,
+                  game_id,
+                  games_processed,
+                  rows_inserted,
+                  "running",
+               )
+               connection.commit()
+
+            if index % 50 == 0 or index == total_games_to_check:
                logging.info(
                   "Season %s progress: checked %s/%s games, games_with_rows=%s, rows_inserted=%s",
                   config.season,
-                  game_index,
+                  index,
                   total_games_to_check,
                   games_processed,
                   rows_inserted,
                )
 
-            if game_id >= SEASON_END_PROBE_START_GAME and empty_game_streak >= SEASON_END_EMPTY_STREAK_GAMES:
-               logging.info(
-                  "Season %s: stopping early at game %s after %s consecutive empty games.",
-                  config.season,
-                  game_id,
-                  empty_game_streak,
-               )
-               break
-            continue
-
-         empty_game_streak = 0
-         inserted = _persist_rows_with_cursor(cursor, rows)
-         games_processed += 1
-         rows_inserted += inserted
-         if capture_edge_deep:
-            for row in rows:
-               team_code = row.get("Team")
-               if team_code:
-                  team_codes_seen.add(str(team_code).upper())
-
-         logging.info(
-            "Game %s parsed rows=%s inserted=%s",
-            game_id,
-            len(rows),
-            inserted,
+         _upsert_run_state(
+            cursor,
+            config.season,
+            config.game_type,
+            config.start_game,
+            config.end_game,
+            completed_through_game,
+            games_processed,
+            rows_inserted,
+            "complete" if completed_normally else "partial",
          )
-
-         if game_index % DB_COMMIT_INTERVAL_GAMES == 0:
-            connection.commit()
-
-         if game_index % 50 == 0 or game_index == total_games_to_check:
-            logging.info(
-               "Season %s progress: checked %s/%s games, games_with_rows=%s, rows_inserted=%s",
-               config.season,
-               game_index,
-               total_games_to_check,
-               games_processed,
-               rows_inserted,
-            )
-
-      connection.commit()
+         connection.commit()
+      except Exception:
+         _upsert_run_state(
+            cursor,
+            config.season,
+            config.game_type,
+            config.start_game,
+            config.end_game,
+            completed_through_game,
+            games_processed,
+            rows_inserted,
+            "failed",
+         )
+         connection.commit()
+         raise
 
    if capture_edge and "web" in active_sources and edge_supported:
       edge_payloads_inserted = capture_edge_summary_snapshots(
@@ -1052,6 +1667,8 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--start-game", type=int, default=1)
    parser.add_argument("--end-game", type=int, default=1271)
    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds.")
+   parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum number of concurrent game fetch workers.")
+   parser.add_argument("--request-delay", type=float, default=DEFAULT_REQUEST_DELAY_SECONDS, help="Minimum delay in seconds between API requests.")
    parser.add_argument("--db-path", default="hockey_shots.db", help="SQLite database path.")
    parser.add_argument("--export-csv", default=None, help="Optional Tableau-compatible CSV export path.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -1091,6 +1708,14 @@ def main() -> None:
 
    filtered_seasons = []
    for season in seasons_to_run:
+      if _season_run_is_complete(args.db_path, season, args.game_type, args.start_game, args.end_game):
+         logging.info(
+            "Skipping season %s: requested range %s-%s is already complete in the database.",
+            season,
+            args.start_game,
+            args.end_game,
+         )
+         continue
       if season_has_coordinate_shots(season, args.game_type, args.timeout):
          filtered_seasons.append(season)
       else:

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 85" role="img" aria-label="Hockey rink">
+  <defs>
+    <linearGradient id="ice" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f8fdff"/>
+      <stop offset="100%" stop-color="#edf6fb"/>
+    </linearGradient>
+    <linearGradient id="shadow" x1="0" x2="1">
+      <stop offset="0%" stop-color="#d8e8f0" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="198" height="83" rx="8" fill="url(#ice)" stroke="#b7cbd7" stroke-width="2"/>
+  <rect x="6" y="6" width="188" height="73" rx="6" fill="none" stroke="#d8e4ea" stroke-width="1.2"/>
+  <rect x="99" y="6" width="2" height="73" fill="#c43434"/>
+  <rect x="23" y="6" width="2" height="73" fill="#1f77d0"/>
+  <rect x="175" y="6" width="2" height="73" fill="#1f77d0"/>
+  <circle cx="100" cy="42.5" r="11" fill="none" stroke="#c43434" stroke-width="1.5"/>
+  <circle cx="100" cy="42.5" r="1.8" fill="#c43434"/>
+  <circle cx="69" cy="21" r="4.2" fill="none" stroke="#1f77d0" stroke-width="1.4"/>
+  <circle cx="69" cy="64" r="4.2" fill="none" stroke="#1f77d0" stroke-width="1.4"/>
+  <circle cx="131" cy="21" r="4.2" fill="none" stroke="#1f77d0" stroke-width="1.4"/>
+  <circle cx="131" cy="64" r="4.2" fill="none" stroke="#1f77d0" stroke-width="1.4"/>
+  <circle cx="39" cy="42.5" r="1.6" fill="#1f77d0"/>
+  <circle cx="161" cy="42.5" r="1.6" fill="#1f77d0"/>
+  <path d="M8 12c35 8 66 10 92 10s57-2 92-10" fill="none" stroke="url(#shadow)" stroke-width="4" opacity="0.55"/>
+  <path d="M8 73c35-8 66-10 92-10s57 2 92 10" fill="none" stroke="url(#shadow)" stroke-width="4" opacity="0.55"/>
+  <path d="M14 6c3 0 6 1 8 3" fill="none" stroke="#d8e4ea" stroke-width="1.1"/>
+  <path d="M186 6c-3 0-6 1-8 3" fill="none" stroke="#d8e4ea" stroke-width="1.1"/>
+  <path d="M14 79c3 0 6-1 8-3" fill="none" stroke="#d8e4ea" stroke-width="1.1"/>
+  <path d="M186 79c-3 0-6-1-8-3" fill="none" stroke="#d8e4ea" stroke-width="1.1"/>
+  <circle cx="15" cy="11" r="1.2" fill="#c43434"/>
+  <circle cx="15" cy="74" r="1.2" fill="#c43434"/>
+  <circle cx="185" cy="11" r="1.2" fill="#c43434"/>
+  <circle cx="185" cy="74" r="1.2" fill="#c43434"/>
+</svg>
