@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import Main
-import requests
 
 
 class TestMainPipeline(unittest.TestCase):
@@ -51,30 +50,6 @@ class TestMainPipeline(unittest.TestCase):
             numbers = Main.fetch_season_game_numbers_from_stats("2023", Main.REGULAR_SEASON, 10)
 
         self.assertEqual(numbers, [1, 2, 42])
-
-    def test_season_has_coordinate_shots_true(self):
-        with patch("Main.fetch_season_game_numbers_from_stats", return_value=[1, 2, 3]):
-            with patch(
-                "Main._fetch_json_allow_404",
-                side_effect=[
-                    {"plays": [{"typeDescKey": "goal", "details": {"eventOwnerTeamId": 1}}]},
-                    {"plays": [{"typeDescKey": "shot-on-goal", "details": {"xCoord": 10, "yCoord": -5}}]},
-                ],
-            ):
-                supported = Main.season_has_coordinate_shots("2013", Main.REGULAR_SEASON, 10, sample_games=3)
-        self.assertTrue(supported)
-
-    def test_season_has_coordinate_shots_false(self):
-        with patch("Main.fetch_season_game_numbers_from_stats", return_value=[1, 2]):
-            with patch(
-                "Main._fetch_json_allow_404",
-                side_effect=[
-                    {"plays": [{"typeDescKey": "goal", "details": {"eventOwnerTeamId": 1}}]},
-                    {"plays": [{"typeDescKey": "shot", "details": {"xCoord": None, "yCoord": None}}]},
-                ],
-            ):
-                supported = Main.season_has_coordinate_shots("2013", Main.REGULAR_SEASON, 10, sample_games=2)
-        self.assertFalse(supported)
 
     def test_parse_web_shot_events(self):
         payload = {
@@ -264,73 +239,6 @@ class TestMainPipeline(unittest.TestCase):
     def test_season_range_rejects_invalid_bounds(self):
         with self.assertRaises(ValueError):
             Main.season_range(2022, 2021)
-
-    def test_discover_earliest_full_season_returns_first_valid(self):
-        class FakeResponse:
-            def __init__(self, payload):
-                self._payload = payload
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return self._payload
-
-        def fake_get(url, timeout=None, params=None):
-            if url.endswith("/season"):
-                return FakeResponse(
-                    ["20082009", "20092010"]
-                )
-            raise AssertionError(f"Unexpected URL call: {url} params={params}")
-
-        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
-            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
-        self.assertEqual(earliest, 2008)
-
-    def test_discover_earliest_full_season_stats_source(self):
-        class FakeResponse:
-            def __init__(self, payload):
-                self._payload = payload
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return self._payload
-
-        def fake_get(url, timeout=None, params=None):
-            if url.endswith("/en/season"):
-                return FakeResponse({"data": [{"id": "20102011"}, {"id": "20112012"}]})
-            raise AssertionError(f"Unexpected URL call: {url} params={params}")
-
-        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
-            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10, preferred_source="stats")
-        self.assertEqual(earliest, 2010)
-
-    def test_discover_earliest_full_season_clamps_to_modern_floor(self):
-        class FakeResponse:
-            def __init__(self, payload):
-                self._payload = payload
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return self._payload
-
-        def fake_get(url, timeout=None, params=None):
-            if url.endswith("/season"):
-                return FakeResponse(["19171918", "19791980"])
-            raise AssertionError(f"Unexpected URL call: {url} params={params}")
-
-        with patch.object(Main._HTTP_SESSION, "get", side_effect=fake_get):
-            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
-        self.assertEqual(earliest, Main.MODERN_ERA_START_SEASON)
-
-    def test_discover_earliest_full_season_fallback_on_failure(self):
-        with patch.object(Main._HTTP_SESSION, "get", side_effect=requests.RequestException("network down")):
-            earliest = Main.discover_earliest_full_season(Main.REGULAR_SEASON, 10)
-        self.assertEqual(earliest, Main.DEFAULT_START_SEASON_FALLBACK)
 
     def test_run_state_helpers_skip_completed_range(self):
         db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_runstate_{uuid.uuid4().hex}.db")

@@ -16,9 +16,8 @@ from urllib3.util.retry import Retry
 
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 STATS_REST_BASE_URL = "https://api.nhle.com/stats/rest"
-# NHL-WHA merger took effect for the 1979-80 NHL season.
-MODERN_ERA_START_SEASON = 1979
-DEFAULT_START_SEASON_FALLBACK = MODERN_ERA_START_SEASON
+# First season observed to include reliable x/y shot coordinates.
+COORDINATE_DATA_START_SEASON = 2005
 
 # Performance tuning defaults for long historical runs.
 DB_COMMIT_INTERVAL_GAMES = 50
@@ -412,34 +411,6 @@ def fetch_season_game_numbers_from_stats(season: str, game_type: str, timeout_se
          continue
 
    return sorted(game_numbers)
-
-
-def season_has_coordinate_shots(
-   season: str,
-   game_type: str,
-   timeout_seconds: int,
-   sample_games: int = 25,
-) -> bool:
-   # Probe a sample of real game IDs to verify x/y coordinate availability for shot events.
-   game_numbers = fetch_season_game_numbers_from_stats(season, game_type, timeout_seconds)
-   if not game_numbers:
-      return False
-
-   for game_id in game_numbers[:sample_games]:
-      payload = _fetch_json_allow_404(build_web_play_by_play_url(season, game_type, game_id), timeout_seconds)
-      if not isinstance(payload, dict):
-         continue
-
-      for play in payload.get("plays", []):
-         event_key = str(play.get("typeDescKey", "")).lower()
-         if event_key not in {"goal", "shot-on-goal", "shot"}:
-            continue
-
-         details = play.get("details", {})
-         if details.get("xCoord") is not None and details.get("yCoord") is not None:
-            return True
-
-   return False
 
 
 def _player_id_from_roster_entry(player: dict) -> int | None:
@@ -1605,47 +1576,6 @@ def current_nhl_season_start_year(today: datetime | None = None) -> int:
    return today.year if today.month >= 9 else today.year - 1
 
 
-def discover_earliest_full_season(game_type: str, timeout_seconds: int, preferred_source: str = "web") -> int:
-   # Detect earliest season using the preferred source, with safe fallback.
-   if preferred_source == "web":
-      seasons_payload = _fetch_json(f"{WEB_API_BASE_URL}/season", timeout_seconds)
-      if not seasons_payload:
-         return DEFAULT_START_SEASON_FALLBACK
-
-      season_ids = []
-      if isinstance(seasons_payload, list):
-         candidate_list = seasons_payload
-      else:
-         candidate_list = seasons_payload.get("seasons", [])
-
-      for season in candidate_list:
-         season_id = str(season)
-         if isinstance(season, dict):
-            season_id = str(season.get("id", season.get("seasonId", "")))
-         if len(season_id) == 8 and season_id.isdigit():
-            season_ids.append(season_id)
-
-      if season_ids:
-         return max(int(sorted(season_ids)[0][:4]), MODERN_ERA_START_SEASON)
-      return DEFAULT_START_SEASON_FALLBACK
-
-   if preferred_source == "stats":
-      seasons_payload = _fetch_json(f"{STATS_REST_BASE_URL}/en/season", timeout_seconds)
-      if not seasons_payload:
-         return DEFAULT_START_SEASON_FALLBACK
-
-      season_ids = []
-      for season in _extract_record_list(seasons_payload):
-         season_id = str(season.get("id") or season.get("seasonId") or "")
-         if len(season_id) == 8 and season_id.isdigit():
-            season_ids.append(season_id)
-
-      if season_ids:
-         return max(int(sorted(season_ids)[0][:4]), MODERN_ERA_START_SEASON)
-
-   return DEFAULT_START_SEASON_FALLBACK
-
-
 def season_range(start_season: int, end_season: int | None) -> list[str]:
    # Build inclusive season start-year labels, for example 2013, 2014, ... 2025.
    resolved_end = end_season if end_season is not None else current_nhl_season_start_year()
@@ -1658,7 +1588,12 @@ def parse_args() -> argparse.Namespace:
    # CLI keeps scrape settings out of the source code.
    parser = argparse.ArgumentParser(description="Scrape NHL shot and goal events into SQLite.")
    parser.add_argument("--season", default=None, help="Single season start year (for example 2013 for 2013-2014).")
-   parser.add_argument("--start-season", type=int, default=None, help="Start season for multi-season run. Defaults to 1979 (NHL-WHA merger era floor).")
+   parser.add_argument(
+      "--start-season",
+      type=int,
+      default=COORDINATE_DATA_START_SEASON,
+      help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first coordinate-data season).",
+   )
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season for multi-season run. Defaults to current NHL season.")
    parser.add_argument("--api-source", default="both", choices=["web", "stats", "both"], help="Choose Web API, Stats REST API, or both.")
    parser.add_argument("--capture-edge", action="store_true", help="Capture NHL Edge summary payloads when web API is enabled.")
@@ -1690,44 +1625,9 @@ def main() -> None:
    if args.season is not None:
       seasons_to_run = [str(args.season)]
    else:
-      discovery_source = "web" if "web" in active_sources else "stats"
-      resolved_start = args.start_season if args.start_season is not None else discover_earliest_full_season(
-         args.game_type,
-         args.timeout,
-         preferred_source=discovery_source,
-      )
-      if resolved_start < MODERN_ERA_START_SEASON:
-         logging.info(
-            "Clamping start season from %s to %s (modern NHL era floor).",
-            resolved_start,
-            MODERN_ERA_START_SEASON,
-         )
-         resolved_start = MODERN_ERA_START_SEASON
+      resolved_start = args.start_season
       logging.info("Using start season %s", resolved_start)
       seasons_to_run = season_range(resolved_start, args.end_season)
-
-   filtered_seasons = []
-   for season in seasons_to_run:
-      if _season_run_is_complete(args.db_path, season, args.game_type, args.start_game, args.end_game):
-         logging.info(
-            "Skipping season %s: requested range %s-%s is already complete in the database.",
-            season,
-            args.start_game,
-            args.end_game,
-         )
-         continue
-      if season_has_coordinate_shots(season, args.game_type, args.timeout):
-         filtered_seasons.append(season)
-      else:
-         logging.info(
-            "Skipping season %s: no shot events with x/y coordinates found in sampled games.",
-            season,
-         )
-
-   seasons_to_run = filtered_seasons
-   if not seasons_to_run:
-      logging.warning("No coordinate-supported seasons found in requested range. Nothing to scrape.")
-      return
 
    total_games_processed = 0
    total_rows_inserted = 0
@@ -1742,6 +1642,8 @@ def main() -> None:
          start_game=args.start_game,
          end_game=args.end_game,
          timeout_seconds=args.timeout,
+         max_workers=args.max_workers,
+         request_delay_seconds=args.request_delay,
          db_path=args.db_path,
          export_csv=None,
       )

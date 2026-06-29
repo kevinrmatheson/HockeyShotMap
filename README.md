@@ -7,7 +7,7 @@ The project now also includes a separate read-only visualization app in [visuali
 ## Script roles
 
 - [Main.py](Main.py) is the active NHL Web API + Stats REST ETL pipeline.
-- [Scraper.py](Scraper.py) is a separate HockeyDB prototype and is not integrated into the active pipeline.
+- [Scraper.py](Scraper.py) is a separate prototype track for future player-level and cross-league data collection (not integrated into the active pipeline).
 - [DataCleaning.py](DataCleaning.py) contains a basic CSV loader utility for follow-on analysis work.
 
 ## What the active scraper collects
@@ -83,7 +83,7 @@ Default run (regular season, full game range, SQLite output):
 python Main.py
 ```
 
-By default this runs from 1979 (NHL-WHA merger era floor) through the current NHL season.
+By default this runs from 2005 (first season with coordinate shot data) through the current NHL season.
 
 When a specific game, team, or player endpoint does not exist for a season (for example expansion-era teams in earlier years), 404 responses are treated as optional and skipped so the scrape can continue.
 
@@ -234,18 +234,28 @@ Current test coverage includes:
 - web play-by-play parser behavior
 - duplicate-safe persistence behavior in SQLite
 
-## What [Scraper.py](Scraper.py) appears to do
+## What [Scraper.py](Scraper.py) is for
 
-[Scraper.py](Scraper.py) imports `BeautifulSoup`, `requests`, and `numpy`, then defines functions for scraping league, team, and player pages from HockeyDB.
+[Scraper.py](Scraper.py) is now kept as an explicit prototype scaffold for future player-level research and scouting datasets.
 
-It is intentionally kept out of the active NHL pipeline for now and still needs repair work before production use.
+Intended long-term uses include:
 
-Known issues include:
+- ranking NHL players for Hall of Fame style analysis projects
+- collecting junior/college/international player histories
+- building draft-prospect style ranking models for non-NHL players
 
-- `BeautifulSoup` is being given a URL string directly instead of fetched HTML.
-- `League_Dict` is treated like a function in one place even though it is a dictionary.
-- Several loops iterate over empty lists instead of the parsed results.
-- `__main__` calls `league_year_scrape(OHL, 2019)` without quoting `OHL`.
+It is intentionally not wired into the active shot-map ingestion path in [Main.py](Main.py).
+
+Because this is a strategic but separate idea, there are two valid paths:
+
+- keep it in this repository as an incubation module while requirements evolve
+- split it into a dedicated repository later once scope and schema stabilize
+
+Current state:
+
+- API shape and persistence schema are not finalized
+- functions are documented placeholders and raise `NotImplementedError`
+- no tests are currently attached to this prototype module
 
 ## Requirements
 
@@ -259,5 +269,5 @@ Known issues include:
 
 ## Current limitations
 
-- [Scraper.py](Scraper.py) remains an unfinished prototype and will need fixes before it can be used.
+- [Scraper.py](Scraper.py) is intentionally a non-production prototype scaffold for future player-level/multi-league work.
 - The active scraper relies on NHL Web API and NHL Stats REST endpoint formats used in the code. If those payloads change, parsing may need updates.
