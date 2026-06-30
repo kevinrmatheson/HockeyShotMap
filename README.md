@@ -179,6 +179,7 @@ Useful options:
 - `--xgb-min-child-weight`
 - `--no-player-effects` (disables shooter_id/goalie_id features, falling back to situation-only model)
 - `--career-lookback` (default `3` trailing seasons for trajectory tracking)
+- `--validation-split-strategy` (default `random`, options: `random` or `temporal` — temporal splits by game date to avoid leakage)
 
 Example with explicit model controls:
 
@@ -190,6 +191,12 @@ Run a situation-only (no player identity) model:
 
 ```bash
 python Metrics.py --db-path hockey_shots.db --season 2024 --no-player-effects
+```
+
+Use temporal validation split (recommended for time-series data):
+
+```bash
+python Metrics.py --db-path hockey_shots.db --season 2024 --validation-split-strategy temporal
 ```
 
 ### Player-adaptive model
@@ -347,7 +354,24 @@ Current test coverage includes:
 - duplicate-safe persistence behavior in SQLite
 - metrics pipeline with player-adaptive xG model, validation metrics, calibration monitoring, and career trajectory computation
 
-## What [Scraper.py](Scraper.py) is for
+## Future Work / Ideas for Next Steps
+
+### Age regression curves for player development
+A natural next step is modeling how player skill evolves with age. Instead of treating each player as a static effect, we could:
+
+- **General age curve** — fit a league-wide aging curve (e.g., peak at ~25-27, decline after 30) for shooters and goalies separately
+- **Archetype-specific curves** — cluster players by style (sniper, playmaker, power forward, butterfly goalie, hybrid) and fit separate curves
+- **Per-player estimation** — with enough seasons, estimate individual aging trajectories (hierarchical Bayesian or mixed-effects model)
+- **Application to non-NHL evaluation** — project junior/college/European players forward using age curves to identify undervalued prospects
+
+This would live in a separate analysis project but could feed back into the xG model as a prior on player effects.
+
+### Other ideas
+- Shift-chart lineups (on-ice teammates/opponents per shot)
+- Pre-shot context (rebound flag, rush vs cycle, zone entry type)
+- Goalie depth/angle from Edge data
+- Model comparison CLI (`--compare-model`)
+- Visualization integration for trajectory tables
 
 [Scraper.py](Scraper.py) is now kept as an explicit prototype scaffold for future player-level research and scouting datasets.
 

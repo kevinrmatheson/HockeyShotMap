@@ -29,6 +29,7 @@ class MetricsConfig:
    epochs: int = 400
    l2_regularization: float = 0.0005
    validation_split: float = 0.2
+   validation_split_strategy: str = "random"  # "random" or "temporal"
    calibration_method: str = "sigmoid"
    calibration_bins: int = 10
    random_seed: int = 42
@@ -48,6 +49,29 @@ def _season_range(start_season: int, end_season: int | None) -> list[str]:
    if resolved_end < start_season:
       raise ValueError("end season must be greater than or equal to start season")
    return [str(year) for year in range(start_season, resolved_end + 1)]
+
+
+def _temporal_split_indices(
+   game_ids: np.ndarray,
+   test_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+   """
+   Split indices temporally by game_id ordering.
+   NHL game_id format: season(4) + game_type(2) + game_number(4) = 10 digits.
+   Higher game_id = later in time.
+   """
+   if len(game_ids) == 0:
+      return np.array([], dtype=int), np.array([], dtype=int)
+   
+   # Sort by game_id to get temporal order
+   sorted_indices = np.argsort(game_ids)
+   split_point = int(len(sorted_indices) * (1.0 - test_size))
+   split_point = max(1, min(split_point, len(sorted_indices) - 1))
+   
+   train_indices = sorted_indices[:split_point]
+   valid_indices = sorted_indices[split_point:]
+   
+   return train_indices, valid_indices
 
 
 def initialize_metrics_tables(db_path: str) -> None:
@@ -269,6 +293,7 @@ def _config_signature(config: MetricsConfig, train_seasons: list[str]) -> str:
       "l2_regularization": config.l2_regularization,
       "min_shots_for_comparison": config.min_shots_for_comparison,
       "validation_split": config.validation_split,
+      "validation_split_strategy": config.validation_split_strategy,
       "calibration_method": config.calibration_method,
       "calibration_bins": config.calibration_bins,
       "random_seed": config.random_seed,
@@ -1387,13 +1412,20 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             and np.unique(training_targets).shape[0] >= 2
          )
          if can_split:
-            x_train, x_valid, y_train, y_valid = train_test_split(
-               training_features,
-               training_targets,
-               test_size=validation_split,
-               random_state=config.random_seed,
-               stratify=training_targets,
-            )
+            if config.validation_split_strategy == "temporal":
+               # Extract game_ids from training rows for temporal split
+               game_ids = np.array([row["game_id"] for row in training_rows], dtype=np.int64)
+               train_idx, valid_idx = _temporal_split_indices(game_ids, validation_split)
+               x_train, x_valid = training_features[train_idx], training_features[valid_idx]
+               y_train, y_valid = training_targets[train_idx], training_targets[valid_idx]
+            else:
+               x_train, x_valid, y_train, y_valid = train_test_split(
+                  training_features,
+                  training_targets,
+                  test_size=validation_split,
+                  random_state=config.random_seed,
+                  stratify=training_targets,
+               )
          else:
             x_train, y_train = training_features, training_targets
             x_valid = np.empty((0, training_features.shape[1]), dtype=np.float64)
@@ -1642,6 +1674,7 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--epochs", type=int, default=400, help="Number of boosting rounds (n_estimators).")
    parser.add_argument("--l2", type=float, default=0.0005, help="L2 regularization strength (XGBoost reg_lambda).")
    parser.add_argument("--validation-split", type=float, default=0.2, help="Validation split fraction used for monitoring and calibration.")
+   parser.add_argument("--validation-split-strategy", default="random", choices=["random", "temporal"], help="Validation split strategy: random or temporal (by game date).")
    parser.add_argument("--calibration-method", default="sigmoid", choices=["sigmoid"], help="Probability calibration method.")
    parser.add_argument("--calibration-bins", type=int, default=10, help="Number of bins for calibration monitoring.")
    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for train/validation split and model training.")
@@ -1679,6 +1712,7 @@ def main() -> None:
       xgb_min_child_weight=args.xgb_min_child_weight,
       use_player_effects=not args.no_player_effects,
       career_lookback_seasons=args.career_lookback,
+      validation_split_strategy=args.validation_split_strategy,
    )
 
    summary = run_metrics_refresh(config)
