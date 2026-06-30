@@ -140,6 +140,8 @@ python Main.py --export-csv 2018NHLShotInfoV2.csv
 
 Advanced metrics are computed in a separate standalone script so the scrape path in `Main.py` stays unchanged.
 
+`Metrics.py` now trains and scores with a calibrated XGBoost xG model. It also writes validation and calibration-monitoring diagnostics into SQLite so you can track model quality over time.
+
 After scraping data into SQLite, run:
 
 ```bash
@@ -159,9 +161,39 @@ Useful options:
 - `--train-start-season`
 - `--train-end-season`
 - `--min-shots` (default `50` for league comparison thresholds)
-- `--learning-rate`
-- `--epochs`
-- `--l2`
+- `--learning-rate` (XGBoost learning rate)
+- `--epochs` (XGBoost boosting rounds / `n_estimators`)
+- `--l2` (XGBoost `reg_lambda`)
+- `--validation-split` (default `0.2` holdout for monitoring and calibration)
+- `--calibration-method` (currently `sigmoid`)
+- `--calibration-bins` (default `10` bins for reliability tracking)
+- `--random-seed`
+- `--xgb-max-depth`
+- `--xgb-subsample`
+- `--xgb-colsample-bytree`
+- `--xgb-min-child-weight`
+
+Example with explicit model controls:
+
+```bash
+python Metrics.py --db-path hockey_shots.db --season 2024 --train-start-season 2022 --validation-split 0.2 --calibration-bins 12 --epochs 500 --xgb-max-depth 5
+```
+
+### Metrics model monitoring outputs
+
+Each run stores:
+
+- model metadata and validation metrics in `metrics_model_runs`
+- reliability-bin diagnostics in `metrics_model_validation_bins`
+- per-shot xG in `shot_xg`
+
+The run summary logged by `Metrics.py` includes:
+
+- validation metrics (`auc`, `log_loss`, `brier`, `ece`) when a holdout split is available
+- `top_features` from XGBoost feature importance
+- `feature_pruning_candidates` for near-zero-importance features
+
+Calibration note: sigmoid calibration (Platt scaling) learns a 1D correction from raw model probabilities to better align predicted probabilities with observed goal rates.
 
 ## Run the visualization app
 

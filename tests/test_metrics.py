@@ -55,6 +55,8 @@ class TestMetricsPipeline(unittest.TestCase):
             min_shots_for_comparison=25,
             learning_rate=0.05,
             epochs=300,
+            validation_split=0.2,
+            calibration_bins=8,
          )
       )
 
@@ -63,17 +65,39 @@ class TestMetricsPipeline(unittest.TestCase):
       self.assertGreater(summary["player_season_rows"], 0)
       self.assertGreater(summary["team_season_rows"], 0)
       self.assertGreater(summary["goalie_season_rows"], 0)
+      self.assertIsNotNone(summary["validation"])
+      self.assertEqual(summary["calibration_method"], "sigmoid")
+      self.assertIn("top_features", summary)
+      self.assertIn("feature_pruning_candidates", summary)
 
       with sqlite3.connect(db_path) as connection:
          player_rows = connection.execute("SELECT COUNT(*) FROM player_season_metrics").fetchone()[0]
          team_rows = connection.execute("SELECT COUNT(*) FROM team_season_metrics").fetchone()[0]
          goalie_rows = connection.execute("SELECT COUNT(*) FROM goalie_season_metrics").fetchone()[0]
          shot_rows = connection.execute("SELECT COUNT(*) FROM shot_xg").fetchone()[0]
+         model_row = connection.execute(
+            """
+            SELECT model_type, validation_auc, validation_log_loss, validation_brier,
+                   validation_ece, calibration_method
+            FROM metrics_model_runs
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+         ).fetchone()
+         bin_rows = connection.execute("SELECT COUNT(*) FROM metrics_model_validation_bins").fetchone()[0]
 
       self.assertGreater(player_rows, 0)
       self.assertGreater(team_rows, 0)
       self.assertGreater(goalie_rows, 0)
       self.assertGreater(shot_rows, 0)
+      self.assertIsNotNone(model_row)
+      self.assertEqual(model_row[0], "xgboost_calibrated_v1")
+      self.assertEqual(model_row[5], "sigmoid")
+      self.assertIsNotNone(model_row[1])
+      self.assertIsNotNone(model_row[2])
+      self.assertIsNotNone(model_row[3])
+      self.assertIsNotNone(model_row[4])
+      self.assertGreater(bin_rows, 0)
 
    def test_metrics_refresh_skips_unchanged_season(self):
       db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_skip_{uuid.uuid4().hex}.db")

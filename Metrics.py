@@ -1,13 +1,19 @@
 import argparse
+import base64
 import json
 import logging
 import math
-import sqlite3
 import hashlib
+import pickle
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
 
 
 @dataclass
@@ -21,9 +27,17 @@ class MetricsConfig:
    learning_rate: float = 0.05
    epochs: int = 400
    l2_regularization: float = 0.0005
+   validation_split: float = 0.2
+   calibration_method: str = "sigmoid"
+   calibration_bins: int = 10
+   random_seed: int = 42
+   xgb_max_depth: int = 4
+   xgb_subsample: float = 0.9
+   xgb_colsample_bytree: float = 0.9
+   xgb_min_child_weight: float = 1.0
 
 
-FEATURE_SPEC_VERSION = "v1"
+FEATURE_SPEC_VERSION = "v2_xgb"
 
 
 def _season_range(start_season: int, end_season: int | None) -> list[str]:
@@ -51,7 +65,14 @@ def initialize_metrics_tables(db_path: str) -> None:
             weights_json TEXT NOT NULL,
             bias REAL NOT NULL,
             config_signature TEXT,
-            train_signature TEXT
+            train_signature TEXT,
+            validation_auc REAL,
+            validation_log_loss REAL,
+            validation_brier REAL,
+            validation_ece REAL,
+            calibration_method TEXT,
+            calibration_payload_json TEXT,
+            feature_importance_json TEXT
          )
          """
       )
@@ -61,6 +82,20 @@ def initialize_metrics_tables(db_path: str) -> None:
          cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN config_signature TEXT")
       if "train_signature" not in model_run_columns:
          cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN train_signature TEXT")
+      if "validation_auc" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN validation_auc REAL")
+      if "validation_log_loss" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN validation_log_loss REAL")
+      if "validation_brier" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN validation_brier REAL")
+      if "validation_ece" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN validation_ece REAL")
+      if "calibration_method" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN calibration_method TEXT")
+      if "calibration_payload_json" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN calibration_payload_json TEXT")
+      if "feature_importance_json" not in model_run_columns:
+         cursor.execute("ALTER TABLE metrics_model_runs ADD COLUMN feature_importance_json TEXT")
       cursor.execute(
          """
          CREATE TABLE IF NOT EXISTS shot_xg (
@@ -149,6 +184,22 @@ def initialize_metrics_tables(db_path: str) -> None:
          )
          """
       )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS metrics_model_validation_bins (
+            model_version TEXT NOT NULL,
+            dataset TEXT NOT NULL,
+            bin_index INTEGER NOT NULL,
+            bin_start REAL NOT NULL,
+            bin_end REAL NOT NULL,
+            shot_count INTEGER NOT NULL,
+            avg_pred REAL NOT NULL,
+            goal_rate REAL NOT NULL,
+            PRIMARY KEY (model_version, dataset, bin_index)
+         )
+         """
+      )
       connection.commit()
 
 
@@ -160,6 +211,14 @@ def _config_signature(config: MetricsConfig, train_seasons: list[str]) -> str:
       "epochs": config.epochs,
       "l2_regularization": config.l2_regularization,
       "min_shots_for_comparison": config.min_shots_for_comparison,
+      "validation_split": config.validation_split,
+      "calibration_method": config.calibration_method,
+      "calibration_bins": config.calibration_bins,
+      "random_seed": config.random_seed,
+      "xgb_max_depth": config.xgb_max_depth,
+      "xgb_subsample": config.xgb_subsample,
+      "xgb_colsample_bytree": config.xgb_colsample_bytree,
+      "xgb_min_child_weight": config.xgb_min_child_weight,
    }
    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -206,11 +265,11 @@ def _lookup_cached_model(
    connection: sqlite3.Connection,
    config_signature: str,
    train_signature: str,
-) -> tuple[str, dict, np.ndarray, float] | None:
+) -> tuple[str, dict, dict] | None:
    connection.row_factory = sqlite3.Row
    row = connection.execute(
       """
-      SELECT model_version, feature_spec_json, weights_json, bias
+      SELECT model_version, feature_spec_json, weights_json
       FROM metrics_model_runs
       WHERE config_signature = ? AND train_signature = ?
       ORDER BY created_at DESC
@@ -222,9 +281,10 @@ def _lookup_cached_model(
       return None
 
    feature_spec_payload = json.loads(row["feature_spec_json"])
-   weight_vector = np.array(json.loads(row["weights_json"]), dtype=np.float64)
-   bias = float(row["bias"])
-   return str(row["model_version"]), feature_spec_payload, weight_vector, bias
+   model_payload = json.loads(row["weights_json"])
+   if not isinstance(model_payload, dict) or "model_blob_b64" not in model_payload:
+      return None
+   return str(row["model_version"]), feature_spec_payload, model_payload
 
 
 def _season_state_row(connection: sqlite3.Connection, season: str) -> sqlite3.Row | None:
@@ -317,14 +377,35 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
    strength_states = sorted({(row["strength_state"] or "Unknown").strip() for row in rows})
    zones = sorted({(row["zone"] or "Unknown").strip() for row in rows})
    return {
-      "numeric": ["shot_distance", "shot_angle", "score_differential", "period", "home_away"],
+      "numeric": [
+         "shot_distance",
+         "shot_angle",
+         "score_differential",
+         "period",
+         "home_away",
+         "distance_squared",
+         "angle_squared",
+         "distance_times_angle",
+         "log_shot_distance",
+         "is_high_danger",
+         "is_slot",
+         "trailing_by_two_plus",
+         "leading_by_two_plus",
+         "is_power_play_for",
+         "is_short_handed",
+      ],
       "shot_type": shot_types,
       "strength_state": strength_states,
       "zone": zones,
    }
 
 
-def _vectorize_rows(rows: list[sqlite3.Row], feature_spec: dict, fit_scaler: bool, scaler: dict | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
+def _vectorize_rows(
+   rows: list[sqlite3.Row],
+   feature_spec: dict,
+   fit_scaler: bool,
+   scaler: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict, list[str]]:
    numeric_matrix: list[list[float]] = []
    categorical_matrix: list[list[float]] = []
    labels: list[float] = []
@@ -351,6 +432,16 @@ def _vectorize_rows(rows: list[sqlite3.Row], feature_spec: dict, fit_scaler: boo
          _safe_float(row["score_differential"], 0.0),
          _safe_float(row["period"], 0.0),
          _safe_float(row["home_away"], 0.0),
+         dist * dist,
+         angle * angle,
+         dist * angle,
+         math.log(max(dist, 1.0)),
+         1.0 if dist <= 20.0 and angle <= 45.0 else 0.0,
+         1.0 if dist <= 35.0 and angle <= 30.0 else 0.0,
+         1.0 if _safe_float(row["score_differential"], 0.0) <= -2.0 else 0.0,
+         1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
+         1.0 if str(row["strength_state"] or "").startswith("5v4") else 0.0,
+         1.0 if str(row["strength_state"] or "").startswith("4v5") else 0.0,
       ]
       numeric_matrix.append(numeric_values)
 
@@ -391,7 +482,11 @@ def _vectorize_rows(rows: list[sqlite3.Row], feature_spec: dict, fit_scaler: boo
 
    features = np.concatenate([standardized_numeric, categorical_array], axis=1)
    targets = np.array(labels, dtype=np.float64)
-   return features, targets, scaler
+   feature_names = list(feature_spec["numeric"])
+   feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
+   feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
+   feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
+   return features, targets, scaler, feature_names
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -399,31 +494,172 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
    return 1.0 / (1.0 + np.exp(-clipped))
 
 
-def _fit_logistic_regression(features: np.ndarray, targets: np.ndarray, learning_rate: float, epochs: int, l2_regularization: float) -> tuple[np.ndarray, float]:
+def _fit_xgboost_classifier(features: np.ndarray, targets: np.ndarray, config: MetricsConfig) -> XGBClassifier:
    if features.shape[0] == 0:
       raise ValueError("cannot fit model with zero rows")
 
-   weight_vector = np.zeros(features.shape[1], dtype=np.float64)
-   bias = 0.0
-   row_count = float(features.shape[0])
+   model = XGBClassifier(
+      objective="binary:logistic",
+      eval_metric="logloss",
+      n_estimators=config.epochs,
+      learning_rate=config.learning_rate,
+      max_depth=config.xgb_max_depth,
+      min_child_weight=config.xgb_min_child_weight,
+      subsample=config.xgb_subsample,
+      colsample_bytree=config.xgb_colsample_bytree,
+      reg_lambda=config.l2_regularization,
+      random_state=config.random_seed,
+      n_jobs=1,
+   )
+   model.fit(features, targets)
+   return model
 
-   for _ in range(epochs):
-      logits = features @ weight_vector + bias
-      probs = _sigmoid(logits)
 
-      error = probs - targets
-      grad_w = (features.T @ error) / row_count + (l2_regularization * weight_vector)
-      grad_b = float(error.mean())
+def _fit_sigmoid_calibrator(raw_probs: np.ndarray, targets: np.ndarray) -> LogisticRegression | None:
+   if raw_probs.shape[0] < 50:
+      return None
 
-      weight_vector -= learning_rate * grad_w
-      bias -= learning_rate * grad_b
+   unique_targets = np.unique(targets)
+   if unique_targets.shape[0] < 2:
+      return None
 
-   return weight_vector, bias
+   clipped = np.clip(raw_probs, 1e-6, 1.0 - 1e-6)
+   logits = np.log(clipped / (1.0 - clipped)).reshape(-1, 1)
+   calibrator = LogisticRegression(solver="lbfgs")
+   calibrator.fit(logits, targets)
+   return calibrator
 
 
-def _score_rows(features: np.ndarray, weight_vector: np.ndarray, bias: float) -> np.ndarray:
-   logits = features @ weight_vector + bias
-   return _sigmoid(logits)
+def _apply_sigmoid_calibration(raw_probs: np.ndarray, calibrator: LogisticRegression | None) -> np.ndarray:
+   if calibrator is None:
+      return np.clip(raw_probs, 0.0, 1.0)
+
+   clipped = np.clip(raw_probs, 1e-6, 1.0 - 1e-6)
+   logits = np.log(clipped / (1.0 - clipped)).reshape(-1, 1)
+   calibrated = calibrator.predict_proba(logits)[:, 1]
+   return np.clip(calibrated, 0.0, 1.0)
+
+
+def _calibration_bins(predictions: np.ndarray, targets: np.ndarray, bin_count: int) -> tuple[list[dict], float]:
+   if predictions.size == 0:
+      return [], 0.0
+
+   bins = max(2, int(bin_count))
+   buckets: list[list[tuple[float, float]]] = [[] for _ in range(bins)]
+   for pred, target in zip(predictions, targets, strict=True):
+      idx = min(bins - 1, int(pred * bins))
+      buckets[idx].append((float(pred), float(target)))
+
+   total = float(predictions.size)
+   rows: list[dict] = []
+   ece = 0.0
+   for idx, bucket in enumerate(buckets):
+      start = idx / bins
+      end = (idx + 1) / bins
+      if not bucket:
+         rows.append(
+            {
+               "bin_index": idx,
+               "bin_start": start,
+               "bin_end": end,
+               "shot_count": 0,
+               "avg_pred": 0.0,
+               "goal_rate": 0.0,
+            }
+         )
+         continue
+
+      preds = np.array([pair[0] for pair in bucket], dtype=np.float64)
+      goals = np.array([pair[1] for pair in bucket], dtype=np.float64)
+      avg_pred = float(preds.mean())
+      goal_rate = float(goals.mean())
+      count = int(goals.size)
+      ece += (count / total) * abs(avg_pred - goal_rate)
+      rows.append(
+         {
+            "bin_index": idx,
+            "bin_start": start,
+            "bin_end": end,
+            "shot_count": count,
+            "avg_pred": avg_pred,
+            "goal_rate": goal_rate,
+         }
+      )
+
+   return rows, float(ece)
+
+
+def _validation_summary(targets: np.ndarray, predictions: np.ndarray, ece: float) -> dict[str, float] | None:
+   if targets.size == 0:
+      return None
+   if np.unique(targets).shape[0] < 2:
+      return None
+
+   return {
+      "auc": float(roc_auc_score(targets, predictions)),
+      "log_loss": float(log_loss(targets, np.clip(predictions, 1e-6, 1.0 - 1e-6))),
+      "brier": float(brier_score_loss(targets, predictions)),
+      "ece": float(ece),
+   }
+
+
+def _serialize_model_payload(model: XGBClassifier, calibrator: LogisticRegression | None) -> dict:
+   payload: dict[str, object] = {
+      "model_blob_b64": base64.b64encode(pickle.dumps(model)).decode("ascii"),
+      "framework": "xgboost_sklearn",
+   }
+   if calibrator is not None:
+      payload["calibrator_blob_b64"] = base64.b64encode(pickle.dumps(calibrator)).decode("ascii")
+   return payload
+
+
+def _deserialize_model_payload(model_payload: dict) -> tuple[XGBClassifier, LogisticRegression | None]:
+   model_blob = base64.b64decode(str(model_payload["model_blob_b64"]))
+   model = pickle.loads(model_blob)
+
+   calibrator_blob = model_payload.get("calibrator_blob_b64")
+   calibrator: LogisticRegression | None = None
+   if calibrator_blob:
+      calibrator = pickle.loads(base64.b64decode(str(calibrator_blob)))
+   return model, calibrator
+
+
+def _feature_importance_summary(feature_names: list[str], model: XGBClassifier) -> dict:
+   importances = np.array(model.feature_importances_, dtype=np.float64)
+   if importances.size != len(feature_names):
+      return {"ranked": [], "near_zero": []}
+
+   ranked = [
+      {"feature": feature_names[idx], "importance": float(score)}
+      for idx, score in enumerate(importances)
+   ]
+   ranked.sort(key=lambda row: row["importance"], reverse=True)
+   near_zero = [row["feature"] for row in ranked if row["importance"] <= 1e-8]
+   return {"ranked": ranked, "near_zero": near_zero}
+
+
+def _persist_validation_bins(cursor: sqlite3.Cursor, model_version: str, dataset: str, bin_rows: list[dict]) -> None:
+   cursor.executemany(
+      """
+      INSERT OR REPLACE INTO metrics_model_validation_bins (
+         model_version, dataset, bin_index, bin_start, bin_end,
+         shot_count, avg_pred, goal_rate
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      [
+         (
+            model_version,
+            dataset,
+            int(row["bin_index"]),
+            float(row["bin_start"]),
+            float(row["bin_end"]),
+            int(row["shot_count"]),
+            float(row["avg_pred"]),
+            float(row["goal_rate"]),
+         )
+         for row in bin_rows
+      ],
+   )
 
 
 def _delete_existing_model_outputs(cursor: sqlite3.Cursor, seasons: list[str]) -> None:
@@ -633,6 +869,9 @@ def _persist_goalie_season_metrics(cursor: sqlite3.Cursor, model_version: str, s
 def run_metrics_refresh(config: MetricsConfig) -> dict:
    initialize_metrics_tables(config.db_path)
 
+   if config.calibration_method != "sigmoid":
+      raise ValueError("only sigmoid calibration is currently supported")
+
    score_seasons = _season_range(config.score_start_season, config.score_end_season)
    train_start = config.score_start_season if config.train_start_season is None else config.train_start_season
    train_end = (config.score_end_season if config.score_end_season is not None else config.score_start_season) if config.train_end_season is None else config.train_end_season
@@ -648,25 +887,54 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
 
       cached_model = _lookup_cached_model(connection, config_signature, train_signature)
       trained_new_model = False
+      feature_importance: dict[str, object] = {"ranked": [], "near_zero": []}
+      validation_metrics: dict[str, float] | None = None
       if cached_model is None:
          training_rows = _load_shot_rows_for_features(connection, train_seasons)
          if len(training_rows) < 200:
             raise ValueError("not enough training rows to fit xG model; scrape more games/seasons first")
 
          feature_spec = _build_feature_spec(training_rows)
-         training_features, training_targets, scaler = _vectorize_rows(training_rows, feature_spec, fit_scaler=True)
-         weight_vector, bias = _fit_logistic_regression(
-            training_features,
-            training_targets,
-            config.learning_rate,
-            config.epochs,
-            config.l2_regularization,
-         )
+         training_features, training_targets, scaler, feature_names = _vectorize_rows(training_rows, feature_spec, fit_scaler=True)
 
-         model_version = f"xg_logreg_v1_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+         validation_split = min(max(float(config.validation_split), 0.0), 0.4)
+         can_split = (
+            validation_split > 0.0
+            and training_features.shape[0] >= 200
+            and np.unique(training_targets).shape[0] >= 2
+         )
+         if can_split:
+            x_train, x_valid, y_train, y_valid = train_test_split(
+               training_features,
+               training_targets,
+               test_size=validation_split,
+               random_state=config.random_seed,
+               stratify=training_targets,
+            )
+         else:
+            x_train, y_train = training_features, training_targets
+            x_valid = np.empty((0, training_features.shape[1]), dtype=np.float64)
+            y_valid = np.empty((0,), dtype=np.float64)
+
+         model = _fit_xgboost_classifier(x_train, y_train, config)
+         calibrator: LogisticRegression | None = None
+         validation_bin_rows: list[dict] = []
+
+         if x_valid.shape[0] > 0:
+            valid_raw_probs = model.predict_proba(x_valid)[:, 1]
+            calibrator = _fit_sigmoid_calibrator(valid_raw_probs, y_valid)
+            valid_probs = _apply_sigmoid_calibration(valid_raw_probs, calibrator)
+            validation_bin_rows, ece = _calibration_bins(valid_probs, y_valid, config.calibration_bins)
+            validation_metrics = _validation_summary(y_valid, valid_probs, ece)
+
+         feature_importance = _feature_importance_summary(feature_names, model)
+
+         model_version = f"xg_xgb_v1_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+         model_payload = _serialize_model_payload(model, calibrator)
          feature_spec_payload = {
             "feature_spec": feature_spec,
             "scaler": scaler,
+            "feature_names": feature_names,
          }
 
          cursor = connection.cursor()
@@ -675,12 +943,14 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             INSERT INTO metrics_model_runs (
                model_version, model_type, created_at, train_start_season, train_end_season,
                score_start_season, score_end_season, row_count, feature_spec_json,
-               weights_json, bias, config_signature, train_signature
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               weights_json, bias, config_signature, train_signature,
+               validation_auc, validation_log_loss, validation_brier, validation_ece,
+               calibration_method, calibration_payload_json, feature_importance_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                model_version,
-               "logistic_regression_v1",
+               "xgboost_calibrated_v1",
                datetime.now(UTC).isoformat(timespec="seconds"),
                train_seasons[0],
                train_seasons[-1],
@@ -688,20 +958,49 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
                score_seasons[-1],
                len(training_rows),
                json.dumps(feature_spec_payload),
-               json.dumps(weight_vector.tolist()),
-               float(bias),
+               json.dumps(model_payload),
+               0.0,
                config_signature,
                train_signature,
+               None if validation_metrics is None else validation_metrics["auc"],
+               None if validation_metrics is None else validation_metrics["log_loss"],
+               None if validation_metrics is None else validation_metrics["brier"],
+               None if validation_metrics is None else validation_metrics["ece"],
+               config.calibration_method,
+               json.dumps({"method": config.calibration_method}),
+               json.dumps(feature_importance),
             ),
          )
+         if validation_bin_rows:
+            _persist_validation_bins(cursor, model_version, "validation", validation_bin_rows)
          connection.commit()
          trained_new_model = True
       else:
-         model_version, feature_spec_payload, weight_vector, bias = cached_model
+         model_version, feature_spec_payload, model_payload = cached_model
+         model, calibrator = _deserialize_model_payload(model_payload)
          training_rows = _load_shot_rows_for_features(connection, train_seasons)
+         row = connection.execute(
+            """
+            SELECT validation_auc, validation_log_loss, validation_brier, validation_ece, feature_importance_json
+            FROM metrics_model_runs
+            WHERE model_version = ?
+            """,
+            (model_version,),
+         ).fetchone()
+         if row is not None and row[0] is not None:
+            validation_metrics = {
+               "auc": float(row[0]),
+               "log_loss": float(row[1]),
+               "brier": float(row[2]),
+               "ece": float(row[3]),
+            }
+         if row is not None and row[4]:
+            feature_importance = json.loads(row[4])
 
       feature_spec = feature_spec_payload["feature_spec"]
       scaler = feature_spec_payload["scaler"]
+      if cached_model is None:
+         model, calibrator = _deserialize_model_payload(model_payload)
 
       dirty_seasons: list[str] = []
       skipped_seasons: list[str] = []
@@ -739,11 +1038,15 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             "trained_seasons": train_seasons,
             "skipped_seasons": skipped_seasons,
             "trained_new_model": trained_new_model,
+            "validation": validation_metrics,
+            "calibration_method": config.calibration_method,
+            "feature_pruning_candidates": feature_importance.get("near_zero", []),
          }
 
       scoring_rows = _load_shot_rows_for_features(connection, dirty_seasons)
-      scoring_features, _, _ = _vectorize_rows(scoring_rows, feature_spec, fit_scaler=False, scaler=scaler)
-      xg_values = _score_rows(scoring_features, weight_vector, bias)
+      scoring_features, _, _, _ = _vectorize_rows(scoring_rows, feature_spec, fit_scaler=False, scaler=scaler)
+      raw_probs = model.predict_proba(scoring_features)[:, 1]
+      xg_values = _apply_sigmoid_calibration(raw_probs, calibrator)
 
       cursor = connection.cursor()
       _delete_existing_model_outputs(cursor, dirty_seasons)
@@ -796,6 +1099,10 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       "trained_seasons": train_seasons,
       "skipped_seasons": skipped_seasons,
       "trained_new_model": trained_new_model,
+      "validation": validation_metrics,
+      "calibration_method": config.calibration_method,
+      "top_features": feature_importance.get("ranked", [])[:10],
+      "feature_pruning_candidates": feature_importance.get("near_zero", []),
    }
    return summary
 
@@ -808,9 +1115,17 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--train-start-season", type=int, default=None, help="Optional start season for model training window.")
    parser.add_argument("--train-end-season", type=int, default=None, help="Optional end season for model training window.")
    parser.add_argument("--min-shots", type=int, default=50, help="Minimum shots for league-comparison ranking in player metrics.")
-   parser.add_argument("--learning-rate", type=float, default=0.05, help="Gradient descent learning rate for logistic regression.")
-   parser.add_argument("--epochs", type=int, default=400, help="Training epochs for logistic regression.")
-   parser.add_argument("--l2", type=float, default=0.0005, help="L2 regularization strength.")
+   parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate for XGBoost trees.")
+   parser.add_argument("--epochs", type=int, default=400, help="Number of boosting rounds (n_estimators).")
+   parser.add_argument("--l2", type=float, default=0.0005, help="L2 regularization strength (XGBoost reg_lambda).")
+   parser.add_argument("--validation-split", type=float, default=0.2, help="Validation split fraction used for monitoring and calibration.")
+   parser.add_argument("--calibration-method", default="sigmoid", choices=["sigmoid"], help="Probability calibration method.")
+   parser.add_argument("--calibration-bins", type=int, default=10, help="Number of bins for calibration monitoring.")
+   parser.add_argument("--random-seed", type=int, default=42, help="Random seed for train/validation split and model training.")
+   parser.add_argument("--xgb-max-depth", type=int, default=4, help="Maximum tree depth for XGBoost.")
+   parser.add_argument("--xgb-subsample", type=float, default=0.9, help="Row subsample ratio for XGBoost.")
+   parser.add_argument("--xgb-colsample-bytree", type=float, default=0.9, help="Feature subsample ratio per tree for XGBoost.")
+   parser.add_argument("--xgb-min-child-weight", type=float, default=1.0, help="Minimum child weight for XGBoost splits.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -829,6 +1144,14 @@ def main() -> None:
       learning_rate=args.learning_rate,
       epochs=args.epochs,
       l2_regularization=args.l2,
+      validation_split=args.validation_split,
+      calibration_method=args.calibration_method,
+      calibration_bins=args.calibration_bins,
+      random_seed=args.random_seed,
+      xgb_max_depth=args.xgb_max_depth,
+      xgb_subsample=args.xgb_subsample,
+      xgb_colsample_bytree=args.xgb_colsample_bytree,
+      xgb_min_child_weight=args.xgb_min_child_weight,
    )
 
    summary = run_metrics_refresh(config)
