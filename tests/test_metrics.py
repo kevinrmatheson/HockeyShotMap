@@ -69,6 +69,8 @@ class TestMetricsPipeline(unittest.TestCase):
       self.assertEqual(summary["calibration_method"], "sigmoid")
       self.assertIn("top_features", summary)
       self.assertIn("feature_pruning_candidates", summary)
+      self.assertEqual(summary["model_type"], "player_adaptive")
+      self.assertGreater(summary.get("player_career_rows", 0), 0)
 
       with sqlite3.connect(db_path) as connection:
          player_rows = connection.execute("SELECT COUNT(*) FROM player_season_metrics").fetchone()[0]
@@ -85,19 +87,23 @@ class TestMetricsPipeline(unittest.TestCase):
             """
          ).fetchone()
          bin_rows = connection.execute("SELECT COUNT(*) FROM metrics_model_validation_bins").fetchone()[0]
+         player_career_rows = connection.execute("SELECT COUNT(*) FROM player_career_trajectory").fetchone()[0]
+         goalie_career_rows = connection.execute("SELECT COUNT(*) FROM goalie_career_trajectory").fetchone()[0]
 
       self.assertGreater(player_rows, 0)
       self.assertGreater(team_rows, 0)
       self.assertGreater(goalie_rows, 0)
       self.assertGreater(shot_rows, 0)
       self.assertIsNotNone(model_row)
-      self.assertEqual(model_row[0], "xgboost_calibrated_v1")
+      self.assertEqual(model_row[0], "xgboost_player_adaptive_v1")
       self.assertEqual(model_row[5], "sigmoid")
       self.assertIsNotNone(model_row[1])
       self.assertIsNotNone(model_row[2])
       self.assertIsNotNone(model_row[3])
       self.assertIsNotNone(model_row[4])
       self.assertGreater(bin_rows, 0)
+      self.assertGreater(player_career_rows, 0)
+      self.assertGreater(goalie_career_rows, 0)
 
    def test_metrics_refresh_skips_unchanged_season(self):
       db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_skip_{uuid.uuid4().hex}.db")
@@ -143,6 +149,7 @@ class TestMetricsPipeline(unittest.TestCase):
             score_start_season=2024,
             min_shots_for_comparison=20,
             epochs=250,
+            use_player_effects=False,
          )
       )
       self.assertEqual(first_summary["scored_seasons"], ["2024"])
@@ -153,6 +160,7 @@ class TestMetricsPipeline(unittest.TestCase):
             score_start_season=2024,
             min_shots_for_comparison=20,
             epochs=250,
+            use_player_effects=False,
          )
       )
 

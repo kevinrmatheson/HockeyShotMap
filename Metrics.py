@@ -13,6 +13,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 
@@ -35,9 +36,11 @@ class MetricsConfig:
    xgb_subsample: float = 0.9
    xgb_colsample_bytree: float = 0.9
    xgb_min_child_weight: float = 1.0
+   use_player_effects: bool = True
+   career_lookback_seasons: int = 3
 
 
-FEATURE_SPEC_VERSION = "v2_xgb"
+FEATURE_SPEC_VERSION = "v3_xgb_player"
 
 
 def _season_range(start_season: int, end_season: int | None) -> list[str]:
@@ -200,6 +203,60 @@ def initialize_metrics_tables(db_path: str) -> None:
          )
          """
       )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS player_career_trajectory (
+            model_version TEXT NOT NULL,
+            shooter TEXT NOT NULL,
+            shooter_id INTEGER NOT NULL,
+            season TEXT NOT NULL,
+            career_shots INTEGER NOT NULL,
+            career_goals INTEGER NOT NULL,
+            career_xg REAL NOT NULL,
+            career_gax REAL NOT NULL,
+            career_shooting_pct REAL NOT NULL,
+            career_xg_per_shot REAL NOT NULL,
+            trailing_3yr_shots INTEGER NOT NULL,
+            trailing_3yr_goals INTEGER NOT NULL,
+            trailing_3yr_xg REAL NOT NULL,
+            trailing_3yr_gax REAL NOT NULL,
+            trailing_3yr_shooting_pct REAL NOT NULL,
+            trailing_3yr_xg_per_shot REAL NOT NULL,
+            this_season_shots INTEGER NOT NULL,
+            this_season_goals INTEGER NOT NULL,
+            this_season_xg REAL NOT NULL,
+            this_season_gax REAL NOT NULL,
+            PRIMARY KEY (model_version, shooter_id, season)
+         )
+         """
+      )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS goalie_career_trajectory (
+            model_version TEXT NOT NULL,
+            goalie TEXT NOT NULL,
+            goalie_id INTEGER NOT NULL,
+            season TEXT NOT NULL,
+            career_shots_against INTEGER NOT NULL,
+            career_goals_against INTEGER NOT NULL,
+            career_xga REAL NOT NULL,
+            career_saves_above_avg REAL NOT NULL,
+            career_save_pct REAL NOT NULL,
+            trailing_3yr_shots_against INTEGER NOT NULL,
+            trailing_3yr_goals_against INTEGER NOT NULL,
+            trailing_3yr_xga REAL NOT NULL,
+            trailing_3yr_saves_above_avg REAL NOT NULL,
+            trailing_3yr_save_pct REAL NOT NULL,
+            this_season_shots_against INTEGER NOT NULL,
+            this_season_goals_against INTEGER NOT NULL,
+            this_season_xga REAL NOT NULL,
+            this_season_saves_above_avg REAL NOT NULL,
+            PRIMARY KEY (model_version, goalie_id, season)
+         )
+         """
+      )
       connection.commit()
 
 
@@ -219,6 +276,8 @@ def _config_signature(config: MetricsConfig, train_seasons: list[str]) -> str:
       "xgb_subsample": config.xgb_subsample,
       "xgb_colsample_bytree": config.xgb_colsample_bytree,
       "xgb_min_child_weight": config.xgb_min_child_weight,
+      "use_player_effects": config.use_player_effects,
+      "career_lookback_seasons": config.career_lookback_seasons,
    }
    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -487,6 +546,166 @@ def _vectorize_rows(
    feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
    feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
    return features, targets, scaler, feature_names
+
+
+def _build_entity_maps(rows: list[sqlite3.Row]) -> tuple[LabelEncoder, LabelEncoder, np.ndarray, np.ndarray]:
+   """Build label encoders for shooter_id and goalie_id from training rows."""
+   shooter_ids_raw = []
+   goalie_ids_raw = []
+
+   for row in rows:
+      sid = row["shooter_id"]
+      gid = row["goalie_id"]
+      shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
+      goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
+
+   shooter_encoder = LabelEncoder()
+   goalie_encoder = LabelEncoder()
+
+   shooter_encoded = shooter_encoder.fit_transform(shooter_ids_raw)
+   goalie_encoded = goalie_encoder.fit_transform(goalie_ids_raw)
+
+   return shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded
+
+
+def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[str]) -> list[sqlite3.Row]:
+   """Load shot rows including shooter_id and goalie_id for player-adaptive modeling."""
+   placeholders = ",".join("?" for _ in seasons)
+   query = f"""
+      SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
+             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
+             shooter_id, goalie_id
+      FROM shots
+      WHERE season IN ({placeholders})
+        AND shot_result IN ('Goal', 'ngshot')
+        AND x IS NOT NULL
+        AND y IS NOT NULL
+        AND COALESCE(is_empty_net, 0) = 0
+        AND shooter_id IS NOT NULL
+        AND goalie_id IS NOT NULL
+   """
+   connection.row_factory = sqlite3.Row
+   return list(connection.execute(query, seasons).fetchall())
+
+
+def _vectorize_rows_with_entities(
+   rows: list[sqlite3.Row],
+   feature_spec: dict,
+   fit_scaler: bool,
+   scaler: dict | None = None,
+   shooter_encoder: LabelEncoder | None = None,
+   goalie_encoder: LabelEncoder | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict, list[str], np.ndarray, np.ndarray, LabelEncoder, LabelEncoder]:
+   """Vectorize rows including shooter_id and goalie_id as numeric entity features."""
+   numeric_matrix: list[list[float]] = []
+   categorical_matrix: list[list[float]] = []
+   labels: list[float] = []
+
+   shot_type_to_idx = {value: idx for idx, value in enumerate(feature_spec["shot_type"])}
+   strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
+   zone_to_idx = {value: idx for idx, value in enumerate(feature_spec["zone"])}
+
+   cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx)
+
+   shooter_ids_raw: list[str] = []
+   goalie_ids_raw: list[str] = []
+
+   for row in rows:
+      dist = _safe_float(row["shot_distance"], default=float("nan"))
+      angle = _safe_float(row["shot_angle"], default=float("nan"))
+      if math.isnan(dist) or math.isnan(angle):
+         dist_fallback, angle_fallback = _derived_distance_and_angle(_safe_float(row["x"]), _safe_float(row["y"]))
+         if math.isnan(dist):
+            dist = dist_fallback
+         if math.isnan(angle):
+            angle = angle_fallback
+
+      numeric_values = [
+         dist,
+         angle,
+         _safe_float(row["score_differential"], 0.0),
+         _safe_float(row["period"], 0.0),
+         _safe_float(row["home_away"], 0.0),
+         dist * dist,
+         angle * angle,
+         dist * angle,
+         math.log(max(dist, 1.0)),
+         1.0 if dist <= 20.0 and angle <= 45.0 else 0.0,
+         1.0 if dist <= 35.0 and angle <= 30.0 else 0.0,
+         1.0 if _safe_float(row["score_differential"], 0.0) <= -2.0 else 0.0,
+         1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
+         1.0 if str(row["strength_state"] or "").startswith("5v4") else 0.0,
+         1.0 if str(row["strength_state"] or "").startswith("4v5") else 0.0,
+      ]
+      numeric_matrix.append(numeric_values)
+
+      category_vec = [0.0] * cat_width
+      shot_type = (row["shot_type"] or "Unknown").strip()
+      strength = (row["strength_state"] or "Unknown").strip()
+      zone = (row["zone"] or "Unknown").strip()
+
+      offset = 0
+      if shot_type in shot_type_to_idx:
+         category_vec[offset + shot_type_to_idx[shot_type]] = 1.0
+      offset += len(shot_type_to_idx)
+
+      if strength in strength_to_idx:
+         category_vec[offset + strength_to_idx[strength]] = 1.0
+      offset += len(strength_to_idx)
+
+      if zone in zone_to_idx:
+         category_vec[offset + zone_to_idx[zone]] = 1.0
+
+      categorical_matrix.append(category_vec)
+      labels.append(1.0 if row["shot_result"] == "Goal" else 0.0)
+
+      sid = row["shooter_id"]
+      gid = row["goalie_id"]
+      shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
+      goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
+
+   numeric_array = np.array(numeric_matrix, dtype=np.float64)
+   categorical_array = np.array(categorical_matrix, dtype=np.float64)
+
+   if fit_scaler:
+      means = numeric_array.mean(axis=0)
+      stds = numeric_array.std(axis=0)
+      stds = np.where(stds < 1e-9, 1.0, stds)
+      scaler = {"means": means.tolist(), "stds": stds.tolist()}
+   if scaler is None:
+      raise ValueError("scaler must be provided when fit_scaler is False")
+
+   means_np = np.array(scaler["means"], dtype=np.float64)
+   stds_np = np.array(scaler["stds"], dtype=np.float64)
+   standardized_numeric = (numeric_array - means_np) / stds_np
+
+   features = np.concatenate([standardized_numeric, categorical_array], axis=1)
+   targets = np.array(labels, dtype=np.float64)
+
+   feature_names = list(feature_spec["numeric"])
+   feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
+   feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
+   feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
+   feature_names.append("shooter_id_encoded")
+   feature_names.append("goalie_id_encoded")
+
+   # Build or reuse label encoders
+   if fit_scaler or shooter_encoder is None or goalie_encoder is None:
+      shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded = _build_entity_maps(rows)
+   else:
+      try:
+         shooter_encoded = shooter_encoder.transform(shooter_ids_raw)
+      except ValueError:
+         shooter_encoder, _, shooter_encoded, _ = _build_entity_maps(rows)
+      try:
+         goalie_encoded = goalie_encoder.transform(goalie_ids_raw)
+      except ValueError:
+         _, goalie_encoder, _, goalie_encoded = _build_entity_maps(rows)
+
+   entity_column = np.column_stack([shooter_encoded.astype(np.float64), goalie_encoded.astype(np.float64)])
+   features = np.concatenate([features, entity_column], axis=1)
+
+   return features, targets, scaler, feature_names, shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -866,6 +1085,251 @@ def _persist_goalie_season_metrics(cursor: sqlite3.Cursor, model_version: str, s
    return len(insert_rows)
 
 
+def _compute_player_career_trajectory(
+   connection: sqlite3.Connection,
+   cursor: sqlite3.Cursor,
+   model_version: str,
+   seasons: list[str],
+   lookback: int,
+) -> int:
+   """Compute career and trailing multi-year stats for each shooter."""
+   placeholders = ",".join("?" for _ in list(seasons) + [model_version])
+   query = f"""
+      SELECT s.shooter,
+             COALESCE(s.shooter_id, -1) AS shooter_id,
+             s.season,
+             COUNT(*) AS shots,
+             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
+             SUM(x.xg) AS xg
+      FROM shots s
+      JOIN shot_xg x ON x.event_hash = s.event_hash
+      WHERE x.model_version = ?
+        AND s.season IN ({placeholders})
+        AND s.shooter_id IS NOT NULL
+      GROUP BY s.shooter_id, s.season
+   """
+   rows = cursor.execute(f"""
+      SELECT s.shooter,
+             COALESCE(s.shooter_id, -1) AS shooter_id,
+             s.season,
+             COUNT(*) AS shots,
+             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
+             SUM(x.xg) AS xg
+      FROM shots s
+      JOIN shot_xg x ON x.event_hash = s.event_hash
+      WHERE x.model_version = ?
+        AND s.shooter_id IS NOT NULL
+      GROUP BY s.shooter_id, s.season
+   """, [model_version]).fetchall()
+
+   # Build a dict: shooter_id -> {season: {shots, goals, xg}}
+   player_data: dict[int, dict[str, dict[str, float]]] = {}
+   for row in rows:
+      sid = int(row[1] or -1)
+      if sid == -1:
+         continue
+      season = str(row[2])
+      player_data.setdefault(sid, {})
+      player_data[sid][season] = {
+         "name": str(row[0] or "Unknown"),
+         "shots": float(row[3] or 0),
+         "goals": float(row[4] or 0),
+         "xg": float(row[5] or 0.0),
+      }
+
+   # Get sorted unique seasons across all players
+   all_seasons = sorted({str(s) for s_data in player_data.values() for s in s_data})
+   season_set = set(seasons)
+
+   insert_rows = []
+   for sid, season_map in player_data.items():
+      name = next(iter(season_map.values()))["name"]
+
+      for season in all_seasons:
+         if season not in season_set:
+            continue
+
+         this_season = season_map.get(season, {"shots": 0, "goals": 0, "xg": 0.0})
+
+         # Career totals: all seasons up to and including current
+         career_shots = 0.0
+         career_goals = 0.0
+         career_xg = 0.0
+         for s in all_seasons:
+            if s <= season:
+               entry = season_map.get(s, {"shots": 0, "goals": 0, "xg": 0.0})
+               career_shots += entry["shots"]
+               career_goals += entry["goals"]
+               career_xg += entry["xg"]
+
+         # Trailing lookback: last N seasons including current
+         trailing_seasons = [s for s in all_seasons if s <= season][-lookback:]
+         trail_shots = 0.0
+         trail_goals = 0.0
+         trail_xg = 0.0
+         for s in trailing_seasons:
+            entry = season_map.get(s, {"shots": 0, "goals": 0, "xg": 0.0})
+            trail_shots += entry["shots"]
+            trail_goals += entry["goals"]
+            trail_xg += entry["xg"]
+
+         insert_rows.append((
+            model_version,
+            name,
+            sid,
+            season,
+            int(career_shots),
+            int(career_goals),
+            career_xg,
+            career_goals - career_xg,
+            career_goals / career_shots if career_shots else 0.0,
+            career_xg / career_shots if career_shots else 0.0,
+            int(trail_shots),
+            int(trail_goals),
+            trail_xg,
+            trail_goals - trail_xg,
+            trail_goals / trail_shots if trail_shots else 0.0,
+            trail_xg / trail_shots if trail_shots else 0.0,
+            int(this_season["shots"]),
+            int(this_season["goals"]),
+            this_season["xg"],
+            this_season["goals"] - this_season["xg"],
+         ))
+
+   if insert_rows:
+      cursor.executemany(
+         """
+         INSERT OR REPLACE INTO player_career_trajectory (
+            model_version, shooter, shooter_id, season,
+            career_shots, career_goals, career_xg, career_gax,
+            career_shooting_pct, career_xg_per_shot,
+            trailing_3yr_shots, trailing_3yr_goals, trailing_3yr_xg, trailing_3yr_gax,
+            trailing_3yr_shooting_pct, trailing_3yr_xg_per_shot,
+            this_season_shots, this_season_goals, this_season_xg, this_season_gax
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         """,
+         insert_rows,
+      )
+
+   return len(insert_rows)
+
+
+def _compute_goalie_career_trajectory(
+   connection: sqlite3.Connection,
+   cursor: sqlite3.Cursor,
+   model_version: str,
+   seasons: list[str],
+   lookback: int,
+) -> int:
+   """Compute career and trailing multi-year stats for each goalie."""
+   rows = cursor.execute(f"""
+      SELECT COALESCE(s.goalie, 'Unknown') AS goalie,
+             COALESCE(s.goalie_id, -1) AS goalie_id,
+             s.season,
+             COUNT(*) AS shots_against,
+             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals_against,
+             SUM(x.xg) AS xga
+      FROM shots s
+      JOIN shot_xg x ON x.event_hash = s.event_hash
+      WHERE x.model_version = ?
+        AND s.goalie_id IS NOT NULL
+      GROUP BY s.goalie_id, s.season
+   """, [model_version]).fetchall()
+
+   goalie_data: dict[int, dict[str, dict[str, float]]] = {}
+   for row in rows:
+      gid = int(row[1] or -1)
+      if gid == -1:
+         continue
+      season = str(row[2])
+      goalie_data.setdefault(gid, {})
+      goalie_data[gid][season] = {
+         "name": str(row[0] or "Unknown"),
+         "shots_against": float(row[3] or 0),
+         "goals_against": float(row[4] or 0),
+         "xga": float(row[5] or 0.0),
+      }
+
+   all_seasons = sorted({str(s) for g_data in goalie_data.values() for s in g_data})
+   season_set = set(seasons)
+
+   insert_rows = []
+   for gid, season_map in goalie_data.items():
+      name = next(iter(season_map.values()))["name"]
+
+      for season in all_seasons:
+         if season not in season_set:
+            continue
+
+         this = season_map.get(season, {"shots_against": 0, "goals_against": 0, "xga": 0.0})
+
+         # Career
+         career_sa = 0.0
+         career_ga = 0.0
+         career_xga = 0.0
+         for s in all_seasons:
+            if s <= season:
+               entry = season_map.get(s, {"shots_against": 0, "goals_against": 0, "xga": 0.0})
+               career_sa += entry["shots_against"]
+               career_ga += entry["goals_against"]
+               career_xga += entry["xga"]
+
+         # Trailing lookback
+         trailing_seasons = [s for s in all_seasons if s <= season][-lookback:]
+         trail_sa = 0.0
+         trail_ga = 0.0
+         trail_xga = 0.0
+         for s in trailing_seasons:
+            entry = season_map.get(s, {"shots_against": 0, "goals_against": 0, "xga": 0.0})
+            trail_sa += entry["shots_against"]
+            trail_ga += entry["goals_against"]
+            trail_xga += entry["xga"]
+
+         career_saves = career_sa - career_ga
+         career_exp_saves = career_sa - career_xga
+         trail_saves = trail_sa - trail_ga
+         trail_exp_saves = trail_sa - trail_xga
+
+         insert_rows.append((
+            model_version,
+            name,
+            gid,
+            season,
+            int(career_sa),
+            int(career_ga),
+            career_xga,
+            career_saves - career_exp_saves,
+            career_saves / career_sa if career_sa else 0.0,
+            int(trail_sa),
+            int(trail_ga),
+            trail_xga,
+            trail_saves - trail_exp_saves,
+            trail_saves / trail_sa if trail_sa else 0.0,
+            int(this["shots_against"]),
+            int(this["goals_against"]),
+            this["xga"],
+            (this["shots_against"] - this["goals_against"]) - (this["shots_against"] - this["xga"]),
+         ))
+
+   if insert_rows:
+      cursor.executemany(
+         """
+         INSERT OR REPLACE INTO goalie_career_trajectory (
+            model_version, goalie, goalie_id, season,
+            career_shots_against, career_goals_against, career_xga,
+            career_saves_above_avg, career_save_pct,
+            trailing_3yr_shots_against, trailing_3yr_goals_against, trailing_3yr_xga,
+            trailing_3yr_saves_above_avg, trailing_3yr_save_pct,
+            this_season_shots_against, this_season_goals_against, this_season_xga,
+            this_season_saves_above_avg
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         """,
+         insert_rows,
+      )
+
+   return len(insert_rows)
+
+
 def run_metrics_refresh(config: MetricsConfig) -> dict:
    initialize_metrics_tables(config.db_path)
 
@@ -889,13 +1353,32 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       trained_new_model = False
       feature_importance: dict[str, object] = {"ranked": [], "near_zero": []}
       validation_metrics: dict[str, float] | None = None
+
+      # Player-adaptive model uses shooter_id and goalie_id as features.
+      # Falls back to base (situation-only) model when entity IDs are sparse.
+      use_player_features = config.use_player_effects and config.score_start_season >= 2010
+
       if cached_model is None:
-         training_rows = _load_shot_rows_for_features(connection, train_seasons)
+         # Try player-adaptive data first; fall back to situation-only data
+         if use_player_features:
+            training_rows = _load_shot_rows_with_entities(connection, train_seasons)
+            if len(training_rows) < 200:
+               use_player_features = False
+               training_rows = _load_shot_rows_for_features(connection, train_seasons)
+         else:
+            training_rows = _load_shot_rows_for_features(connection, train_seasons)
+
          if len(training_rows) < 200:
             raise ValueError("not enough training rows to fit xG model; scrape more games/seasons first")
 
          feature_spec = _build_feature_spec(training_rows)
-         training_features, training_targets, scaler, feature_names = _vectorize_rows(training_rows, feature_spec, fit_scaler=True)
+
+         if use_player_features:
+            training_features, training_targets, scaler, feature_names, _, _, shooter_encoder, goalie_encoder = _vectorize_rows_with_entities(
+               training_rows, feature_spec, fit_scaler=True,
+            )
+         else:
+            training_features, training_targets, scaler, feature_names = _vectorize_rows(training_rows, feature_spec, fit_scaler=True)
 
          validation_split = min(max(float(config.validation_split), 0.0), 0.4)
          can_split = (
@@ -929,13 +1412,20 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
 
          feature_importance = _feature_importance_summary(feature_names, model)
 
-         model_version = f"xg_xgb_v1_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+         model_slug = "xgb_player" if use_player_features else "xgb_base"
+         model_type_name = "xgboost_player_adaptive_v1" if use_player_features else "xgboost_calibrated_v1"
+         model_version = f"xg_{model_slug}_v1_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
          model_payload = _serialize_model_payload(model, calibrator)
+
          feature_spec_payload = {
             "feature_spec": feature_spec,
             "scaler": scaler,
             "feature_names": feature_names,
+            "use_player_features": use_player_features,
          }
+         if use_player_features:
+            feature_spec_payload["shooter_classes"] = shooter_encoder.classes_.tolist()
+            feature_spec_payload["goalie_classes"] = goalie_encoder.classes_.tolist()
 
          cursor = connection.cursor()
          cursor.execute(
@@ -950,7 +1440,7 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             """,
             (
                model_version,
-               "xgboost_calibrated_v1",
+               model_type_name,
                datetime.now(UTC).isoformat(timespec="seconds"),
                train_seasons[0],
                train_seasons[-1],
@@ -978,7 +1468,12 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       else:
          model_version, feature_spec_payload, model_payload = cached_model
          model, calibrator = _deserialize_model_payload(model_payload)
-         training_rows = _load_shot_rows_for_features(connection, train_seasons)
+         feature_spec_payload.setdefault("use_player_features", False)
+         use_player_features = bool(feature_spec_payload["use_player_features"])
+         if use_player_features:
+            training_rows = _load_shot_rows_with_entities(connection, train_seasons)
+         else:
+            training_rows = _load_shot_rows_for_features(connection, train_seasons)
          row = connection.execute(
             """
             SELECT validation_auc, validation_log_loss, validation_brier, validation_ece, feature_importance_json
@@ -1029,11 +1524,14 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       if not dirty_seasons:
          return {
             "model_version": model_version,
+            "model_type": "player_adaptive" if use_player_features else "base_situation",
             "training_rows": len(training_rows),
             "scored_shots": 0,
             "player_season_rows": 0,
             "team_season_rows": 0,
             "goalie_season_rows": 0,
+            "player_career_rows": 0,
+            "goalie_career_rows": 0,
             "scored_seasons": [],
             "trained_seasons": train_seasons,
             "skipped_seasons": skipped_seasons,
@@ -1043,8 +1541,25 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             "feature_pruning_candidates": feature_importance.get("near_zero", []),
          }
 
-      scoring_rows = _load_shot_rows_for_features(connection, dirty_seasons)
-      scoring_features, _, _, _ = _vectorize_rows(scoring_rows, feature_spec, fit_scaler=False, scaler=scaler)
+      # Score dirty seasons with appropriate vectorizer
+      if use_player_features:
+         scoring_rows = _load_shot_rows_with_entities(connection, dirty_seasons)
+         shooter_encoder = LabelEncoder()
+         goalie_encoder = LabelEncoder()
+         shooter_classes = feature_spec_payload.get("shooter_classes", [])
+         goalie_classes = feature_spec_payload.get("goalie_classes", [])
+         if shooter_classes:
+            shooter_encoder.classes_ = np.array(shooter_classes)
+         if goalie_classes:
+            goalie_encoder.classes_ = np.array(goalie_classes)
+         scoring_features, _, _, _, _, _, _, _ = _vectorize_rows_with_entities(
+            scoring_rows, feature_spec, fit_scaler=False, scaler=scaler,
+            shooter_encoder=shooter_encoder, goalie_encoder=goalie_encoder,
+         )
+      else:
+         scoring_rows = _load_shot_rows_for_features(connection, dirty_seasons)
+         scoring_features, _, _, _ = _vectorize_rows(scoring_rows, feature_spec, fit_scaler=False, scaler=scaler)
+
       raw_probs = model.predict_proba(scoring_features)[:, 1]
       xg_values = _apply_sigmoid_calibration(raw_probs, calibrator)
 
@@ -1073,6 +1588,11 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       team_count = _persist_team_season_metrics(cursor, model_version, dirty_seasons)
       goalie_count = _persist_goalie_season_metrics(cursor, model_version, dirty_seasons)
 
+      # Compute career trajectory tables
+      career_lookback = max(1, int(config.career_lookback_seasons))
+      player_career_count = _compute_player_career_trajectory(connection, cursor, model_version, dirty_seasons, career_lookback)
+      goalie_career_count = _compute_goalie_career_trajectory(connection, cursor, model_version, dirty_seasons, career_lookback)
+
       for season in dirty_seasons:
          fingerprint = score_fingerprint[season]
          _upsert_season_state(
@@ -1090,11 +1610,14 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
 
    summary = {
       "model_version": model_version,
+      "model_type": "player_adaptive" if use_player_features else "base_situation",
       "training_rows": len(training_rows),
       "scored_shots": len(scoring_rows),
       "player_season_rows": player_count,
       "team_season_rows": team_count,
       "goalie_season_rows": goalie_count,
+      "player_career_rows": player_career_count,
+      "goalie_career_rows": goalie_career_count,
       "scored_seasons": dirty_seasons,
       "trained_seasons": train_seasons,
       "skipped_seasons": skipped_seasons,
@@ -1126,6 +1649,8 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--xgb-subsample", type=float, default=0.9, help="Row subsample ratio for XGBoost.")
    parser.add_argument("--xgb-colsample-bytree", type=float, default=0.9, help="Feature subsample ratio per tree for XGBoost.")
    parser.add_argument("--xgb-min-child-weight", type=float, default=1.0, help="Minimum child weight for XGBoost splits.")
+   parser.add_argument("--no-player-effects", action="store_true", help="Disable shooter_id and goalie_id features (situation-only model).")
+   parser.add_argument("--career-lookback", type=int, default=3, help="Number of trailing seasons for career trajectory tracking.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -1152,6 +1677,8 @@ def main() -> None:
       xgb_subsample=args.xgb_subsample,
       xgb_colsample_bytree=args.xgb_colsample_bytree,
       xgb_min_child_weight=args.xgb_min_child_weight,
+      use_player_effects=not args.no_player_effects,
+      career_lookback_seasons=args.career_lookback,
    )
 
    summary = run_metrics_refresh(config)

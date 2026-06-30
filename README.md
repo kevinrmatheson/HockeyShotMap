@@ -140,7 +140,12 @@ python Main.py --export-csv 2018NHLShotInfoV2.csv
 
 Advanced metrics are computed in a separate standalone script so the scrape path in `Main.py` stays unchanged.
 
-`Metrics.py` now trains and scores with a calibrated XGBoost xG model. It also writes validation and calibration-monitoring diagnostics into SQLite so you can track model quality over time.
+`Metrics.py` now trains and scores with a calibrated XGBoost xG model. It supports two model modes:
+
+- **Base situation model** — uses only shot-location and game-state features (league-average shooter vs. league-average goalie).
+- **Player-adaptive model** (default) — adds `shooter_id` and `goalie_id` as features so the model learns individual shooter finishing skill and goalie saving ability. This produces per-shot xG that reflects who took the shot and who was in net.
+
+It also writes validation and calibration-monitoring diagnostics into SQLite so you can track model quality over time, and computes career trajectory tables that track player and goalie performance across multiple seasons.
 
 After scraping data into SQLite, run:
 
@@ -172,11 +177,59 @@ Useful options:
 - `--xgb-subsample`
 - `--xgb-colsample-bytree`
 - `--xgb-min-child-weight`
+- `--no-player-effects` (disables shooter_id/goalie_id features, falling back to situation-only model)
+- `--career-lookback` (default `3` trailing seasons for trajectory tracking)
 
 Example with explicit model controls:
 
 ```bash
-python Metrics.py --db-path hockey_shots.db --season 2024 --train-start-season 2022 --validation-split 0.2 --calibration-bins 12 --epochs 500 --xgb-max-depth 5
+python Metrics.py --db-path hockey_shots.db --season 2024 --train-start-season 2022 --validation-split 0.2 --epochs 500 --xgb-max-depth 5
+```
+
+Run a situation-only (no player identity) model:
+
+```bash
+python Metrics.py --db-path hockey_shots.db --season 2024 --no-player-effects
+```
+
+### Player-adaptive model
+
+When enabled (default for seasons 2010+), `shooter_id` and `goalie_id` are added as categorical features to the XGBoost model. This allows the model to learn:
+
+- **Shooter skill** — some players are consistently better finishers from the same locations
+- **Goalie skill** — some goalies save shots at a higher rate from the same situations
+
+The model version will show `xgboost_player_adaptive_v1` as the model type. The xG values in `shot_xg` then reflect "what is the probability this specific shooter scores on this specific goalie from this situation."
+
+### Career trajectory tables
+
+Two new tables track multi-year performance to answer "is this player getting better or worse?":
+
+- `player_career_trajectory` — per-shooter, per-season:
+  - Career totals (shots, goals, xG, GAx, shooting%)
+  - Trailing 3-year rolling averages
+  - Current season totals
+- `goalie_career_trajectory` — per-goalie, per-season:
+  - Career totals (shots against, goals against, xGA, saves above avg, save%)
+  - Trailing 3-year rolling averages
+  - Current season totals
+
+You can query these tables directly:
+
+```sql
+-- Find shooters whose 3-year xG/shot is above their career average (improving)
+SELECT shooter, season,
+       career_xg_per_shot,
+       trailing_3yr_xg / trailing_3yr_shots AS trailing_xg_per_shot
+FROM player_career_trajectory
+WHERE trailing_3yr_shots >= 100
+  AND (trailing_3yr_xg / trailing_3yr_shots) > career_xg_per_shot
+ORDER BY (trailing_3yr_xg / trailing_3yr_shots) - career_xg_per_shot DESC;
+
+-- Goalies trending down
+SELECT goalie, season, career_saves_above_avg, trailing_3yr_saves_above_avg
+FROM goalie_career_trajectory
+WHERE trailing_3yr_saves_above_avg < career_saves_above_avg;
 ```
 
 ### Metrics model monitoring outputs
@@ -292,6 +345,7 @@ Current test coverage includes:
 - parser behavior with complete and partial event payloads
 - web play-by-play parser behavior
 - duplicate-safe persistence behavior in SQLite
+- metrics pipeline with player-adaptive xG model, validation metrics, calibration monitoring, and career trajectory computation
 
 ## What [Scraper.py](Scraper.py) is for
 
