@@ -136,6 +136,33 @@ Run and export Tableau-compatible CSV:
 python Main.py --export-csv 2018NHLShotInfoV2.csv
 ```
 
+## Run advanced metrics (post-scrape)
+
+Advanced metrics are computed in a separate standalone script so the scrape path in `Main.py` stays unchanged.
+
+After scraping data into SQLite, run:
+
+```bash
+python Metrics.py --db-path hockey_shots.db --season 2024
+```
+
+Refresh behavior is season-aware and incremental:
+
+- metrics are stored season-by-season in derived tables
+- rerunning with unchanged source rows for a season skips recalculating that season
+- when training data or model settings change, affected seasons are recalculated
+- this keeps season-level outputs stable for later multi-season rollups in visualization queries
+
+Useful options:
+
+- `--end-season`
+- `--train-start-season`
+- `--train-end-season`
+- `--min-shots` (default `50` for league comparison thresholds)
+- `--learning-rate`
+- `--epochs`
+- `--l2`
+
 ## Run the visualization app
 
 The dashboard reads the database directly, so you can open it later without rerunning the scraper.

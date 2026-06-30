@@ -6,7 +6,8 @@ import logging
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from dataclasses import dataclass
 
@@ -21,10 +22,11 @@ COORDINATE_DATA_START_SEASON = 2005
 
 # Performance tuning defaults for long historical runs.
 DB_COMMIT_INTERVAL_GAMES = 50
-SEASON_END_PROBE_START_GAME = 900
-SEASON_END_EMPTY_STREAK_GAMES = 150
+SEASON_END_PROBE_START_GAME = 50
+SEASON_END_EMPTY_STREAK_GAMES = 50
 DEFAULT_MAX_WORKERS = 4
-DEFAULT_REQUEST_DELAY_SECONDS = 0.15
+DEFAULT_REQUEST_DELAY_SECONDS = 0.05
+HEARTBEAT_LOG_INTERVAL_SECONDS = 20
 HTTP_RETRY_TOTAL = 5
 HTTP_RETRY_BACKOFF_FACTOR = 0.6
 HTTP_RATE_LIMIT_STATUSES = {429, 500, 502, 503, 504}
@@ -209,24 +211,33 @@ def edge_is_supported_for_season(season: str, game_type: str, timeout_seconds: i
 
 def detect_available_sources(api_source: str, timeout_seconds: int) -> list[str]:
    requested = ["web", "stats"] if api_source == "both" else [api_source]
-   available = []
+   verified = []
 
    if "web" in requested:
       if _fetch_json(f"{WEB_API_BASE_URL}/season", timeout_seconds) is not None:
-         available.append("web")
+         verified.append("web")
       else:
-         logging.warning("Web API unavailable: %s", WEB_API_BASE_URL)
+         logging.warning(
+            "Web API preflight check failed (%s). Keeping web enabled and attempting at runtime.",
+            WEB_API_BASE_URL,
+         )
 
    if "stats" in requested:
       if _fetch_json(f"{STATS_REST_BASE_URL}/ping", timeout_seconds) is not None:
-         available.append("stats")
+         verified.append("stats")
       else:
-         logging.warning("Stats REST API unavailable: %s", STATS_REST_BASE_URL)
+         logging.warning(
+            "Stats REST API preflight check failed (%s). Keeping stats enabled and attempting at runtime.",
+            STATS_REST_BASE_URL,
+         )
 
-   if not available:
-      raise RuntimeError("No requested NHL API sources are reachable. Check DNS/network access.")
+   if not verified:
+      logging.warning(
+         "No API sources passed preflight checks. Proceeding with requested sources anyway: %s",
+         ", ".join(requested),
+      )
 
-   return available
+   return requested
 
 
 def _home_away_value(team_code: str | None, home_code: str | None, away_code: str | None) -> int | None:
@@ -932,6 +943,16 @@ def _fetch_and_parse_game_rows(season: str, game_type: str, game_id: int, timeou
       web_json = _fetch_json_allow_404(web_url, timeout_seconds)
       if web_json is not None:
          rows.extend(parse_web_shot_events(web_json, season, game_id))
+
+   if "stats" in api_sources and not rows:
+      full_game_id = int(f"{season}{game_type}{game_id:04d}")
+      stats_payload = _fetch_json(
+         build_stats_shiftcharts_url(),
+         timeout_seconds,
+         params={"cayenneExp": f"gameId={full_game_id}", "limit": -1},
+      )
+      if stats_payload is not None:
+         rows.extend(parse_stats_shift_events(stats_payload, season, game_id))
    return rows
 
 
@@ -942,18 +963,36 @@ def _iter_game_rows_parallel(
    timeout_seconds: int,
    active_sources: list[str],
    max_workers: int,
-) -> list[tuple[int, list[dict]]]:
+) -> Iterator[tuple[int, list[dict]]]:
    if max_workers <= 1 or len(game_numbers) <= 1:
-      return [(game_id, _fetch_and_parse_game_rows(season, game_type, game_id, timeout_seconds, active_sources)) for game_id in game_numbers]
+      for game_id in game_numbers:
+         yield game_id, _fetch_and_parse_game_rows(season, game_type, game_id, timeout_seconds, active_sources)
+      return
 
-   results: list[tuple[int, list[dict]]] = []
-   batch_size = max(1, max_workers * 4)
-   for batch_start in range(0, len(game_numbers), batch_size):
-      batch = game_numbers[batch_start : batch_start + batch_size]
-      with ThreadPoolExecutor(max_workers=max_workers) as executor:
-         for game_id, rows in zip(batch, executor.map(lambda gid: _fetch_and_parse_game_rows(season, game_type, gid, timeout_seconds, active_sources), batch)):
-            results.append((game_id, rows))
-   return results
+   total_games = len(game_numbers)
+   logging.info(
+      "Season %s: fetching %s games with %s workers",
+      season,
+      total_games,
+      max_workers,
+   )
+   with ThreadPoolExecutor(max_workers=max_workers) as executor:
+      futures = {
+         executor.submit(_fetch_and_parse_game_rows, season, game_type, game_id, timeout_seconds, active_sources): game_id
+         for game_id in game_numbers
+      }
+      completed_rows: dict[int, list[dict]] = {}
+      next_index = 0
+
+      for future in as_completed(futures):
+         game_id = futures[future]
+         completed_rows[game_id] = future.result()
+         while next_index < total_games:
+            next_game_id = game_numbers[next_index]
+            if next_game_id not in completed_rows:
+               break
+            yield next_game_id, completed_rows.pop(next_game_id)
+            next_index += 1
 
 
 def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
@@ -1410,6 +1449,22 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
       cursor = connection.cursor()
       completed_through_game = resume_start_game - 1
       completed_normally = True
+      last_heartbeat = time.monotonic()
+
+      def log_heartbeat(index: int, game_id: int) -> None:
+         nonlocal last_heartbeat
+         now = time.monotonic()
+         if now - last_heartbeat >= HEARTBEAT_LOG_INTERVAL_SECONDS:
+            logging.info(
+               "Season %s heartbeat: checked %s/%s games, games_with_rows=%s, rows_inserted=%s, last_game=%s",
+               config.season,
+               index,
+               total_games_to_check,
+               games_processed,
+               rows_inserted,
+               game_id,
+            )
+            last_heartbeat = now
 
       try:
          for index, (game_id, rows) in enumerate(
@@ -1469,6 +1524,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
                      "running",
                   )
                   connection.commit()
+               log_heartbeat(index, game_id)
                continue
 
             empty_game_streak = 0
@@ -1488,6 +1544,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
                len(rows),
                inserted,
             )
+            log_heartbeat(index, game_id)
 
             if index % DB_COMMIT_INTERVAL_GAMES == 0:
                _upsert_run_state(
@@ -1513,6 +1570,15 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
                   rows_inserted,
                )
 
+         final_status = "complete" if completed_normally else "partial"
+         if completed_normally and total_games_to_check > 0 and rows_inserted == 0:
+            logging.warning(
+               "Season %s produced zero inserted rows after checking %s games; marking run as partial for safe retry.",
+               config.season,
+               total_games_to_check,
+            )
+            final_status = "partial"
+
          _upsert_run_state(
             cursor,
             config.season,
@@ -1522,7 +1588,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
             completed_through_game,
             games_processed,
             rows_inserted,
-            "complete" if completed_normally else "partial",
+            final_status,
          )
          connection.commit()
       except Exception:

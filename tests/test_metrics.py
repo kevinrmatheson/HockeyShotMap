@@ -1,0 +1,141 @@
+import sqlite3
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+
+import Main
+import Metrics
+
+
+class TestMetricsPipeline(unittest.TestCase):
+   def test_metrics_refresh_creates_derived_outputs(self):
+      db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_{uuid.uuid4().hex}.db")
+      Main.initialize_database(db_path)
+
+      rows = []
+      for game_id in range(1, 11):
+         for shot_index in range(1, 31):
+            is_goal = 1 if shot_index % 7 == 0 else 0
+            rows.append(
+               {
+                  "Shot": "Goal" if is_goal else "ngshot",
+                  "X": 65.0 + (shot_index % 20),
+                  "Y": -15.0 + (shot_index % 30),
+                  "Shot_Type": "Wrist" if shot_index % 2 == 0 else "Slap",
+                  "Shooter": "Player A" if shot_index % 3 == 0 else "Player B",
+                  "Shooter_ID": 101 if shot_index % 3 == 0 else 202,
+                  "Team": "TOR" if shot_index % 2 == 0 else "MTL",
+                  "Home_Away": 1 if game_id % 2 == 0 else 0,
+                  "Period": 1 + (shot_index % 3),
+                  "Period_Time": "10:00",
+                  "Period_Time_Remaining": "10:00",
+                  "Year": "2024",
+                  "GameID": game_id,
+                  "API_Source": "web",
+                  "Goalie": "Goalie X" if shot_index % 2 == 0 else "Goalie Y",
+                  "Goalie_ID": 301 if shot_index % 2 == 0 else 302,
+                  "Shot_Distance": 20.0 + (shot_index % 40),
+                  "Shot_Angle": 5.0 + (shot_index % 55),
+                  "Is_Empty_Net": 0,
+                  "Strength_State": "5v5" if shot_index % 4 else "5v4",
+                  "Score_Differential": (shot_index % 5) - 2,
+                  "Zone": "OZ" if shot_index % 2 == 0 else "DZ",
+                  "Event_ID": (game_id * 1000) + shot_index,
+               }
+            )
+
+      inserted = Main.persist_rows(db_path, rows)
+      self.assertGreater(inserted, 200)
+
+      summary = Metrics.run_metrics_refresh(
+         Metrics.MetricsConfig(
+            db_path=db_path,
+            score_start_season=2024,
+            min_shots_for_comparison=25,
+            learning_rate=0.05,
+            epochs=300,
+         )
+      )
+
+      self.assertEqual(summary["scored_seasons"], ["2024"])
+      self.assertGreater(summary["scored_shots"], 0)
+      self.assertGreater(summary["player_season_rows"], 0)
+      self.assertGreater(summary["team_season_rows"], 0)
+      self.assertGreater(summary["goalie_season_rows"], 0)
+
+      with sqlite3.connect(db_path) as connection:
+         player_rows = connection.execute("SELECT COUNT(*) FROM player_season_metrics").fetchone()[0]
+         team_rows = connection.execute("SELECT COUNT(*) FROM team_season_metrics").fetchone()[0]
+         goalie_rows = connection.execute("SELECT COUNT(*) FROM goalie_season_metrics").fetchone()[0]
+         shot_rows = connection.execute("SELECT COUNT(*) FROM shot_xg").fetchone()[0]
+
+      self.assertGreater(player_rows, 0)
+      self.assertGreater(team_rows, 0)
+      self.assertGreater(goalie_rows, 0)
+      self.assertGreater(shot_rows, 0)
+
+   def test_metrics_refresh_skips_unchanged_season(self):
+      db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_skip_{uuid.uuid4().hex}.db")
+      Main.initialize_database(db_path)
+
+      rows = []
+      for game_id in range(1, 9):
+         for shot_index in range(1, 26):
+            is_goal = 1 if shot_index % 6 == 0 else 0
+            rows.append(
+               {
+                  "Shot": "Goal" if is_goal else "ngshot",
+                  "X": 62.0 + (shot_index % 25),
+                  "Y": -18.0 + (shot_index % 35),
+                  "Shot_Type": "Wrist" if shot_index % 2 == 0 else "Snap",
+                  "Shooter": "Player C" if shot_index % 3 == 0 else "Player D",
+                  "Shooter_ID": 401 if shot_index % 3 == 0 else 402,
+                  "Team": "COL" if shot_index % 2 == 0 else "DAL",
+                  "Home_Away": 1 if game_id % 2 == 0 else 0,
+                  "Period": 1 + (shot_index % 3),
+                  "Period_Time": "10:00",
+                  "Period_Time_Remaining": "10:00",
+                  "Year": "2024",
+                  "GameID": game_id,
+                  "API_Source": "web",
+                  "Goalie": "Goalie M" if shot_index % 2 == 0 else "Goalie N",
+                  "Goalie_ID": 501 if shot_index % 2 == 0 else 502,
+                  "Shot_Distance": 18.0 + (shot_index % 38),
+                  "Shot_Angle": 4.0 + (shot_index % 50),
+                  "Is_Empty_Net": 0,
+                  "Strength_State": "5v5",
+                  "Score_Differential": (shot_index % 5) - 2,
+                  "Zone": "OZ" if shot_index % 2 == 0 else "DZ",
+                  "Event_ID": (game_id * 1000) + shot_index,
+               }
+            )
+
+      Main.persist_rows(db_path, rows)
+
+      first_summary = Metrics.run_metrics_refresh(
+         Metrics.MetricsConfig(
+            db_path=db_path,
+            score_start_season=2024,
+            min_shots_for_comparison=20,
+            epochs=250,
+         )
+      )
+      self.assertEqual(first_summary["scored_seasons"], ["2024"])
+
+      second_summary = Metrics.run_metrics_refresh(
+         Metrics.MetricsConfig(
+            db_path=db_path,
+            score_start_season=2024,
+            min_shots_for_comparison=20,
+            epochs=250,
+         )
+      )
+
+      self.assertEqual(second_summary["scored_seasons"], [])
+      self.assertEqual(second_summary["skipped_seasons"], ["2024"])
+      self.assertEqual(second_summary["scored_shots"], 0)
+
+
+if __name__ == "__main__":
+   unittest.main()

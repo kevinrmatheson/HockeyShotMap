@@ -51,6 +51,29 @@ class TestMainPipeline(unittest.TestCase):
 
         self.assertEqual(numbers, [1, 2, 42])
 
+    def test_fetch_and_parse_game_rows_stats_source(self):
+        with patch("Main._fetch_json", return_value={"data": [{"eventType": "shot", "xCoord": 10, "yCoord": 5}]}) as fetch_mock:
+            rows = Main._fetch_and_parse_game_rows("2025", Main.REGULAR_SEASON, 1, 10, ["stats"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["API_Source"], "stats")
+        self.assertEqual(rows[0]["GameID"], 1)
+        self.assertEqual(rows[0]["Year"], "2025")
+        fetch_mock.assert_called_once()
+
+    def test_fetch_and_parse_game_rows_web_rows_skip_stats_fallback(self):
+        with patch("Main._fetch_json_allow_404", return_value={"plays": [{"typeDescKey": "goal", "details": {"xCoord": 10, "yCoord": 5}}]}), patch("Main._fetch_json") as fetch_mock:
+            rows = Main._fetch_and_parse_game_rows("2025", Main.REGULAR_SEASON, 1, 10, ["web", "stats"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["API_Source"], "web")
+        fetch_mock.assert_not_called()
+
+    def test_detect_available_sources_keeps_requested_on_partial_preflight_failure(self):
+        with patch("Main._fetch_json", side_effect=[None, {"ok": True}]):
+            sources = Main.detect_available_sources("both", 10)
+        self.assertEqual(sources, ["web", "stats"])
+
     def test_parse_web_shot_events(self):
         payload = {
             "homeTeam": {"abbrev": "TOR"},

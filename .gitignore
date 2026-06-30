@@ -1,0 +1,12 @@
+# Local SQLite artifacts
+hockey_shots.db
+hockey_shots.db-journal
+*.db-journal
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
