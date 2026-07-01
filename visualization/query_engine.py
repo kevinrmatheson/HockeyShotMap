@@ -108,6 +108,7 @@ def get_summary(db_path: str, filters: HeatmapFilters) -> dict[str, Any]:
          SUM(CASE WHEN shot_result = 'Goal' THEN 1 ELSE 0 END) AS goal_count
       FROM shots
       WHERE {where_clause}
+        AND x IS NOT NULL
    """
 
    with _connect(db_path) as connection:
@@ -127,12 +128,13 @@ def get_heatmap_bins(db_path: str, filters: HeatmapFilters, bin_size: float = DE
    where_clause, params = _build_where(filters)
    query = f"""
       SELECT
-         CAST((x + 100.0) / ? AS INTEGER) AS bin_x,
-         CAST((y + 42.5) / ? AS INTEGER) AS bin_y,
+         CAST(ABS(x) / ? AS INTEGER) AS bin_x,
+         CAST(CASE WHEN x < 0 THEN (-y + 42.5) ELSE (y + 42.5) END / ? AS INTEGER) AS bin_y,
          COUNT(*) AS shot_count,
          SUM(CASE WHEN shot_result = 'Goal' THEN 1 ELSE 0 END) AS goal_count
       FROM shots
       WHERE {where_clause}
+        AND x IS NOT NULL
       GROUP BY bin_x, bin_y
       ORDER BY shot_count DESC
    """
@@ -146,7 +148,7 @@ def get_heatmap_bins(db_path: str, filters: HeatmapFilters, bin_size: float = DE
       goal_count = int(row["goal_count"] or 0) if row["goal_count"] is not None else 0
       x_bin = int(row["bin_x"])
       y_bin = int(row["bin_y"])
-      center_x = (x_bin * bin_size) - 100.0 + (bin_size / 2.0)
+      center_x = (x_bin * bin_size) + (bin_size / 2.0)
       center_y = (y_bin * bin_size) - 42.5 + (bin_size / 2.0)
       goal_pct = (goal_count / shot_count * 100.0) if shot_count else 0.0
 

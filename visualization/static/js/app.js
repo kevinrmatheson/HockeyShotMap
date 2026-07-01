@@ -17,6 +17,8 @@ const controls = {
    goalPctMode: document.getElementById("goal-pct-mode"),
    copyLink: document.getElementById("copy-link-button"),
    reset: document.getElementById("reset-button"),
+   sensitivity: document.getElementById("sensitivity-slider"),
+   sensValue: document.getElementById("sens-value"),
 };
 
 const summaryEls = {
@@ -37,6 +39,7 @@ const state = {
    period: "all",
    mode: "density",
    bin_size: 5,
+   sensitivity: 1.0,
 };
 
 let currentBins = [];
@@ -58,6 +61,10 @@ function parseStateFromUrl() {
       const parsed = Number(params.get("bin_size"));
       if (!Number.isNaN(parsed) && parsed > 0) state.bin_size = parsed;
    }
+   if (params.get("sens")) {
+      const parsed = Number(params.get("sens"));
+      if (!Number.isNaN(parsed) && parsed > 0) state.sensitivity = parsed;
+   }
 }
 
 function syncUrl() {
@@ -71,6 +78,7 @@ function syncUrl() {
    if (state.period !== "all") params.set("period", state.period);
    if (state.mode !== "density") params.set("mode", state.mode);
    if (state.bin_size !== 5) params.set("bin_size", String(state.bin_size));
+   if (state.sensitivity !== 1.0) params.set("sens", String(state.sensitivity));
 
    const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}`;
    window.history.replaceState({}, "", nextUrl);
@@ -108,6 +116,8 @@ function syncControlsFromState() {
    controls.shotResult.value = state.shot_result;
    controls.homeAway.value = state.home_away;
    controls.period.value = state.period;
+   controls.sensitivity.value = String(state.sensitivity);
+   controls.sensValue.textContent = state.sensitivity.toFixed(2);
    setMode(state.mode);
 }
 
@@ -169,14 +179,17 @@ function resizeCanvas() {
 }
 
 function normalizeCanvasPoint(pointX, pointY) {
-   const x = ((pointX + 100) / 200) * canvasSize.width;
+   const x = (pointX / 100) * canvasSize.width;
    const y = ((42.5 - pointY) / 85) * canvasSize.height;
    return { x, y };
 }
 
 function heatColor(value, maxValue, mode, shotCount) {
    const safeMax = Math.max(1, maxValue);
-   const normalized = Math.min(1, value / safeMax);
+   const rawNormalized = Math.min(1, value / safeMax);
+   // Apply sensitivity as a power curve: <1 = ramp faster, >1 = ramp slower
+   const power = 1.0 / Math.max(0.1, state.sensitivity);
+   const normalized = Math.pow(rawNormalized, power);
    const intensity = Math.min(1, Math.max(0.15, shotCount / Math.max(1, currentSummary.shot_count || 1)));
 
    if (mode === "goal_pct") {
@@ -200,7 +213,7 @@ function renderHeatmap() {
    canvasContext.clearRect(0, 0, canvasSize.width, canvasSize.height);
    currentBins.forEach((bin) => {
       const position = normalizeCanvasPoint(bin.x, bin.y);
-      const binWidth = (state.bin_size / 200) * canvasSize.width;
+      const binWidth = (state.bin_size / 100) * canvasSize.width;
       const binHeight = (state.bin_size / 85) * canvasSize.height;
       const value = state.mode === "goal_pct" ? bin.goal_pct : bin.shot_count;
       const maxValue = state.mode === "goal_pct"
@@ -222,7 +235,7 @@ function updateTooltip(event) {
    const x = (event.clientX - rect.left) * (canvasSize.width / rect.width);
    const y = (event.clientY - rect.top) * (canvasSize.height / rect.height);
 
-   const binWidth = (state.bin_size / 200) * canvasSize.width;
+   const binWidth = (state.bin_size / 100) * canvasSize.width;
    const binHeight = (state.bin_size / 85) * canvasSize.height;
    const hovered = currentBins.find((bin) => {
       const position = normalizeCanvasPoint(bin.x, bin.y);
@@ -323,6 +336,11 @@ async function initialize() {
    });
    controls.densityMode.addEventListener("click", () => setModeAndRefresh("density"));
    controls.goalPctMode.addEventListener("click", () => setModeAndRefresh("goal_pct"));
+   controls.sensitivity.addEventListener("input", () => {
+      state.sensitivity = Number(controls.sensitivity.value);
+      controls.sensValue.textContent = state.sensitivity.toFixed(2);
+      renderHeatmap();
+   });
    controls.copyLink.addEventListener("click", async () => {
       await navigator.clipboard.writeText(window.location.href);
       controls.copyLink.textContent = "Copied";
@@ -339,6 +357,9 @@ async function initialize() {
       state.home_away = "all";
       state.period = "all";
       state.mode = "density";
+      state.sensitivity = 1.0;
+      controls.sensitivity.value = "1.0";
+      controls.sensValue.textContent = "1.00";
       syncControlsFromState();
       refreshDashboard().catch(console.error);
    });

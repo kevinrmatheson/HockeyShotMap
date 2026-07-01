@@ -172,10 +172,12 @@ h1 {
 }
 
 .mode-toggle,
+.sens-control,
 .action-buttons {
    display: flex;
    gap: 10px;
    flex-wrap: wrap;
+   align-items: center;
 }
 
 .mode-button,
@@ -198,6 +200,67 @@ h1 {
 .mode-button.is-active {
    background: linear-gradient(135deg, rgba(83, 212, 255, 0.18), rgba(255, 179, 71, 0.18));
    border-color: rgba(141, 215, 255, 0.55);
+}
+
+.sens-control {
+   display: flex;
+   align-items: center;
+   gap: 10px;
+   background: rgba(255, 255, 255, 0.04);
+   border: 1px solid rgba(173, 197, 233, 0.12);
+   border-radius: 999px;
+   padding: 6px 16px;
+}
+
+.sens-label {
+   font-size: 0.82rem;
+   color: var(--muted);
+   white-space: nowrap;
+}
+
+.sens-slider {
+   -webkit-appearance: none;
+   appearance: none;
+   width: 100px;
+   height: 4px;
+   border-radius: 2px;
+   background: rgba(255, 255, 255, 0.15);
+   outline: none;
+   cursor: pointer;
+}
+
+.sens-slider::-webkit-slider-thumb {
+   -webkit-appearance: none;
+   appearance: none;
+   width: 16px;
+   height: 16px;
+   border-radius: 50%;
+   background: var(--accent-2);
+   border: 2px solid rgba(255, 255, 255, 0.3);
+   cursor: pointer;
+   transition: transform 0.12s ease;
+}
+
+.sens-slider::-webkit-slider-thumb:hover {
+   transform: scale(1.2);
+}
+
+.sens-slider::-moz-range-thumb {
+   width: 16px;
+   height: 16px;
+   border-radius: 50%;
+   background: var(--accent-2);
+   border: 2px solid rgba(255, 255, 255, 0.3);
+   cursor: pointer;
+}
+
+.sens-value {
+   font-size: 0.85rem;
+   font-weight: 700;
+   color: var(--text);
+   min-width: 2.2em;
+   text-align: center;
+   font-variant-numeric: tabular-nums;
 }
 
 .summary-grid {
@@ -253,7 +316,7 @@ h1 {
 .rink-stage {
    position: relative;
    width: 100%;
-   aspect-ratio: 200 / 85;
+   aspect-ratio: 100 / 85;
    overflow: hidden;
    border-radius: 18px;
    background: linear-gradient(180deg, rgba(14, 30, 52, 0.72), rgba(7, 16, 29, 0.92));
@@ -268,9 +331,10 @@ h1 {
 }
 
 .rink-image {
-   object-fit: cover;
-   opacity: 0.96;
-   filter: drop-shadow(0 30px 70px rgba(0, 0, 0, 0.24));
+   display: block;
+   object-fit: fill;
+   opacity: 0.9;
+   border-radius: 18px;
 }
 
 #heatmap-canvas {
