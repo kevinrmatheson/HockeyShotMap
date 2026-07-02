@@ -338,6 +338,41 @@ Export fields are preserved in this order:
 - `Zone`
 - `Event_ID`
 
+## Player biographical data (player_bio.py)
+
+A separate module fetches and stores NHL player biographical data from the NHL Web API (`/v1/player/{id}/landing`). This is useful for enriching shot data with player attributes like height, weight, handedness, birth date, and draft info.
+
+```bash
+# Fetch bios for a range of player IDs (resumable, rate-limited)
+python player_bio.py --start-player-id 1 --end-player-id 9999999 --db-path hockey_shots.db
+
+# Resume from last completed ID (automatic on re-run)
+python player_bio.py --start-player-id 1 --end-player-id 9999999 --db-path hockey_shots.db
+
+# Force re-fetch all players in range (overwrites existing)
+python player_bio.py --start-player-id 1 --end-player-id 9999999 --force-refresh --db-path hockey_shots.db
+
+# Check current fetch status
+python player_bio.py --status --db-path hockey_shots.db
+```
+
+Key features:
+- **Resumable**: Tracks last completed player ID in `player_bio_fetch_state` table; re-runs pick up where they left off
+- **Rate limited**: 0.1s default delay between requests (configurable via `--request-delay`)
+- **Parallel**: 2 workers by default (`--max-workers`)
+- **Idempotent**: `INSERT OR REPLACE` on `player_id` primary key; skips existing unless `--force-refresh`
+- **Not found handling**: Player IDs that return 404 are counted but don't stop the run
+
+Stored in `players` table:
+- `player_id` (PK), `first_name`, `last_name`, `full_name`
+- `height_inches`, `height_cm`, `weight_lbs`, `weight_kg`
+- `birth_date`, `birth_city`, `birth_state_province`, `birth_country`
+- `shoots_catches` (L/R), `position` (C/LW/RW/D/G)
+- `draft_year`, `draft_team`, `draft_round`, `draft_pick_in_round`, `draft_overall_pick`
+- `fetched_at` timestamp
+
+Join with `shots` table on `shooter_id` or `goalie_id` for enriched analysis.
+
 ## Tests
 
 Run tests with:
