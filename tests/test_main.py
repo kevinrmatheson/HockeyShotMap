@@ -286,6 +286,96 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(Main._resume_start_game(db_path, "2024", Main.REGULAR_SEASON, 1, 10), 11)
         self.assertFalse(Main._season_run_is_complete(db_path, "2024", Main.REGULAR_SEASON, 1, 11))
 
+    def test_load_team_codes_for_season(self):
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_teamcodes_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        rows = [
+            {
+                "Shot": "Goal",
+                "X": 20.0,
+                "Y": -3.0,
+                "Shot_Type": "Wrist Shot",
+                "Shooter": "A",
+                "Team": "tor",
+                "Home_Away": 1,
+                "Period": 1,
+                "Year": "2024",
+                "GameID": 1,
+            },
+            {
+                "Shot": "ngshot",
+                "X": 10.0,
+                "Y": 5.0,
+                "Shot_Type": "Slap",
+                "Shooter": "B",
+                "Team": " TOR ",
+                "Home_Away": 0,
+                "Period": 2,
+                "Year": "2024",
+                "GameID": 2,
+            },
+            {
+                "Shot": "ngshot",
+                "X": 15.0,
+                "Y": 7.0,
+                "Shot_Type": "Backhand",
+                "Shooter": "C",
+                "Team": "MTL",
+                "Home_Away": 0,
+                "Period": 2,
+                "Year": "2024",
+                "GameID": 3,
+            },
+        ]
+        Main.persist_rows(db_path, rows)
+
+        team_codes = Main._load_team_codes_for_season(db_path, "2024")
+        self.assertEqual(team_codes, {"TOR", "MTL"})
+
+    def test_run_edge_capture_only_summary_and_deep(self):
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_edgeonly_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+        Main.persist_rows(
+            db_path,
+            [
+                {
+                    "Shot": "Goal",
+                    "X": 20.0,
+                    "Y": -3.0,
+                    "Shot_Type": "Wrist Shot",
+                    "Shooter": "Test Shooter",
+                    "Team": "TOR",
+                    "Home_Away": 1,
+                    "Period": 1,
+                    "Year": "2024",
+                    "GameID": 1,
+                }
+            ],
+        )
+
+        config = Main.ScrapeConfig(
+            season="2024",
+            game_type=Main.REGULAR_SEASON,
+            start_game=1,
+            end_game=1,
+            timeout_seconds=10,
+            db_path=db_path,
+        )
+
+        with patch("Main.edge_is_supported_for_season", return_value=True), patch("Main.capture_edge_summary_snapshots", return_value=3), patch("Main.capture_edge_deep_snapshots", return_value=5) as deep_mock:
+            edge_payloads, edge_detail_payloads = Main.run_edge_capture_only(
+                config,
+                ["web"],
+                capture_edge=True,
+                capture_edge_deep=True,
+            )
+
+        self.assertEqual(edge_payloads, 3)
+        self.assertEqual(edge_detail_payloads, 5)
+        deep_mock.assert_called_once()
+        self.assertEqual(deep_mock.call_args.args[4], {"TOR"})
+
 
 if __name__ == "__main__":
     unittest.main()

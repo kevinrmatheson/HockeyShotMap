@@ -1664,7 +1664,7 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
 
 def parse_args() -> argparse.Namespace:
    parser = argparse.ArgumentParser(description="Build xG/xSV derived metrics from scraped shot data.")
-   parser.add_argument("--db-path", default="hockey_shots.db", help="SQLite database path from Main.py scrape output.")
+   parser.add_argument("--db-path", default="hockey_data.db", help="SQLite database path from Main.py scrape output.")
    parser.add_argument("--season", type=int, required=True, help="Start season to score (for example 2024 for 2024-25).")
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season to score.")
    parser.add_argument("--train-start-season", type=int, default=None, help="Optional start season for model training window.")

@@ -3,9 +3,9 @@
 This module fetches player biographical data from the NHL Web API
 and stores it in a local SQLite database. It is designed to be:
 - Rate limited (respects NHL API limits)
-- Resumable (tracks last successfully fetched player ID)
-- Idempotent (safe to re-run, uses INSERT OR REPLACE)
-- Configurable (can force full re-fetch if needed)
+- Targeted (default collects player IDs from the shots table)
+- Idempotent (safe to re-run, skips existing entries)
+- Configurable (--range to manually specify IDs, --force-refresh to re-fetch)
 """
 
 import argparse
@@ -24,13 +24,13 @@ from urllib3.util.retry import Retry
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 
 # Player bio fetching defaults
-PLAYER_BIO_REQUEST_DELAY_SECONDS = 0.1  # Slightly more conservative than game scraping
+PLAYER_BIO_REQUEST_DELAY_SECONDS = 0.3  # Conservative delay to avoid NHL API rate limits
 PLAYER_BIO_HTTP_RETRY_TOTAL = 5
 PLAYER_BIO_HTTP_RETRY_BACKOFF_FACTOR = 0.6
-PLAYER_BIO_HTTP_RATE_LIMIT_STATUSES = {429, 500, 502, 503, 504}
+PLAYER_BIO_HTTP_RATE_LIMIT_STATUSES = {500, 502, 503, 504}  # 429 handled by our own retry logic
 PLAYER_BIO_DB_COMMIT_INTERVAL = 50  # Commit every N players
 PLAYER_BIO_HEARTBEAT_INTERVAL_SECONDS = 30
-PLAYER_BIO_DEFAULT_MAX_WORKERS = 2  # Conservative for player bios
+PLAYER_BIO_DEFAULT_MAX_WORKERS = 1  # Single worker is safer for rate-limited APIs
 PLAYER_BIO_DEFAULT_TIMEOUT_SECONDS = 10
 
 # State tracking table name
@@ -46,13 +46,12 @@ _PLAYER_BIO_THREAD_LOCAL = threading.local()
 
 
 def _build_player_bio_retry_adapter() -> HTTPAdapter:
+    """Minimal adapter — no automatic retries on status codes (we handle that ourselves)."""
     retry = Retry(
-        total=PLAYER_BIO_HTTP_RETRY_TOTAL,
-        connect=PLAYER_BIO_HTTP_RETRY_TOTAL,
-        read=PLAYER_BIO_HTTP_RETRY_TOTAL,
-        status=PLAYER_BIO_HTTP_RETRY_TOTAL,
-        backoff_factor=PLAYER_BIO_HTTP_RETRY_BACKOFF_FACTOR,
-        status_forcelist=PLAYER_BIO_HTTP_RATE_LIMIT_STATUSES,
+        total=0,  # Don't auto-retry anything — our code manages retries
+        connect=0,
+        read=0,
+        status=0,
         allowed_methods=frozenset({"GET"}),
         raise_on_status=False,
     )
@@ -68,28 +67,51 @@ _PLAYER_BIO_HTTP_SESSION.mount("https://", _build_player_bio_retry_adapter())
 
 
 class _PlayerBioRateLimiter:
-    """Thread-safe rate limiter for player bio API requests."""
+    """Thread-safe rate limiter for player bio API requests.
+
+    Automatically adapts: when a 429 is encountered, the delay is doubled.
+    On success, it gradually relaxes back toward the configured minimum.
+    """
 
     def __init__(self, minimum_interval_seconds: float) -> None:
-        self.minimum_interval_seconds = max(0.0, minimum_interval_seconds)
+        self._configured_minimum = max(0.0, minimum_interval_seconds)
+        self._current_interval = max(0.0, minimum_interval_seconds)
         self._lock = threading.Lock()
         self._next_allowed_time = 0.0
 
     def acquire(self) -> None:
-        if self.minimum_interval_seconds <= 0:
+        if self._current_interval <= 0:
             return
 
         with self._lock:
             now = time.monotonic()
-            if now < self._next_allowed_time:
-                sleep_seconds = self._next_allowed_time - now
-                self._next_allowed_time += self.minimum_interval_seconds
+            wait = self._next_allowed_time - now
+            if wait > 0:
+                self._next_allowed_time += self._current_interval
             else:
-                sleep_seconds = 0.0
-                self._next_allowed_time = now + self.minimum_interval_seconds
+                wait = 0.0
+                self._next_allowed_time = now + self._current_interval
 
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+        if wait > 0:
+            time.sleep(wait)
+
+    def report_success(self) -> None:
+        """Called after a successful API response. Gradually relaxes delay."""
+        with self._lock:
+            # Relax toward configured minimum
+            self._current_interval = max(
+                self._configured_minimum,
+                self._current_interval * 0.9,
+            )
+
+    def report_throttled(self) -> None:
+        """Called after a 429 response. Doubles the delay (capped at 30s)."""
+        with self._lock:
+            self._current_interval = min(30.0, self._current_interval * 2)
+            logging.warning(
+                "Rate limit hit — backing off to %.1fs between requests",
+                self._current_interval,
+            )
 
 
 _PLAYER_BIO_RATE_LIMITER = _PlayerBioRateLimiter(PLAYER_BIO_REQUEST_DELAY_SECONDS)
@@ -97,7 +119,7 @@ _PLAYER_BIO_RATE_LIMITER = _PlayerBioRateLimiter(PLAYER_BIO_REQUEST_DELAY_SECOND
 
 def configure_player_bio_rate_limit(minimum_interval_seconds: float) -> None:
     """Configure the minimum interval between player bio API requests."""
-    _PLAYER_BIO_RATE_LIMITER.minimum_interval_seconds = max(0.0, minimum_interval_seconds)
+    _PLAYER_BIO_RATE_LIMITER._configured_minimum = max(0.0, minimum_interval_seconds)
 
 
 def _get_player_bio_http_session() -> requests.Session:
@@ -116,14 +138,15 @@ def _get_player_bio_http_session() -> requests.Session:
 
 
 @dataclass
+@dataclass
 class PlayerBioConfig:
     """Runtime settings for player bio fetching."""
-    start_player_id: int = 1
-    end_player_id: int = 9999999  # Practical upper bound for NHL player IDs
+    start_player_id: int = 0    # 0 = collect IDs from shots table
+    end_player_id: int = 0      # 0 = collect IDs from shots table
     timeout_seconds: int = PLAYER_BIO_DEFAULT_TIMEOUT_SECONDS
     max_workers: int = PLAYER_BIO_DEFAULT_MAX_WORKERS
     request_delay_seconds: float = PLAYER_BIO_REQUEST_DELAY_SECONDS
-    db_path: str = "hockey_shots.db"
+    db_path: str = "hockey_data.db"
     force_refresh: bool = False  # If True, re-fetch all players even if already stored
 
 
@@ -132,19 +155,34 @@ def build_web_player_landing_url(player_id: int) -> str:
     return f"{WEB_API_BASE_URL}/player/{player_id}/landing"
 
 
-def _fetch_player_bio_json(url: str, timeout_seconds: int) -> dict | None:
-    """Fetch player bio JSON from NHL API with rate limiting and retries."""
+def _fetch_player_bio_json(url: str, timeout_seconds: int) -> tuple[dict | None, int | None]:
+    """
+    Fetch player bio JSON from NHL API with rate limiting and retries.
+    Returns (parsed_json, status_code).
+    On rate-limit (429), returns (None, 429) so the caller can retry later.
+    On 404, returns (None, 404) — ID doesn't exist.
+    On other errors, returns (None, status_code) for diagnostics.
+    """
     try:
         _PLAYER_BIO_RATE_LIMITER.acquire()
         response = _get_player_bio_http_session().get(url, timeout=timeout_seconds)
-        if response.status_code == 404:
-            # Player ID doesn't exist - this is normal for gaps in ID space
-            return None
+        status = response.status_code
+        if status == 429:
+            _PLAYER_BIO_RATE_LIMITER.report_throttled()
+            return None, 429
+        if status == 404:
+            _PLAYER_BIO_RATE_LIMITER.report_success()
+            return None, 404
         response.raise_for_status()
-        return response.json()
+        _PLAYER_BIO_RATE_LIMITER.report_success()
+        return response.json(), status
+    except requests.exceptions.RetryError as exc:
+        logging.warning("Retry exhausted for %s: %s", url, exc)
+        _PLAYER_BIO_RATE_LIMITER.report_throttled()
+        return None, 429
     except (requests.RequestException, ValueError) as exc:
         logging.warning("Failed to fetch player bio from %s: %s", url, exc)
-        return None
+        return None, None
 
 
 def _normalize_text(value: object | None) -> str | None:
@@ -418,13 +456,39 @@ def upsert_player_bio(db_path: str, bio: dict) -> bool:
     return True
 
 
-def fetch_single_player_bio(player_id: int, timeout_seconds: int) -> dict | None:
-    """Fetch and parse a single player's bio. Returns None if not found or error."""
+def fetch_single_player_bio(player_id: int, timeout_seconds: int) -> tuple[dict | None, int | None]:
+    """Fetch and parse a single player's bio.
+    Returns (parsed_bio, status_code).
+    Status 429 means rate-limited and worth retrying; 404 means ID doesn't exist.
+    """
     url = build_web_player_landing_url(player_id)
-    payload = _fetch_player_bio_json(url, timeout_seconds)
+    payload, status = _fetch_player_bio_json(url, timeout_seconds)
     if payload is None:
-        return None
-    return parse_player_bio(payload)
+        return None, status
+    return parse_player_bio(payload), status
+
+
+def _collect_player_ids_from_shots(db_path: str) -> list[int]:
+    """Collect distinct player IDs (shooters + goalies) from the shots table."""
+    with sqlite3.connect(db_path) as connection:
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT DISTINCT id FROM (
+                SELECT Shooter_ID AS id FROM shots WHERE Shooter_ID IS NOT NULL
+                UNION
+                SELECT Goalie_ID AS id FROM shots WHERE Goalie_ID IS NOT NULL
+            )
+            ORDER BY id
+        """)
+        ids = [row[0] for row in cursor.fetchall()]
+    if not ids:
+        logging.warning(
+            "No player IDs found in shots table. "
+            "Run Main.py to scrape shot data first, or use --range to specify a manual range."
+        )
+    else:
+        logging.info("Collected %d unique player IDs from shots table (range %d–%d)", len(ids), ids[0], ids[-1])
+    return ids
 
 
 def _fetch_and_store_player_bio(
@@ -435,15 +499,20 @@ def _fetch_and_store_player_bio(
 ) -> tuple[bool, str]:
     """
     Fetch and store a single player's bio.
-    Returns (success, status) where status is one of: 'fetched', 'skipped_existing', 'not_found', 'error'
+    Returns (success, status) where status is one of:
+    'fetched', 'skipped_existing', 'not_found', 'rate_limited', 'error'
     """
     # Check if already exists (unless force_refresh)
     if not force_refresh and _player_exists_in_db(db_path, player_id):
         return True, "skipped_existing"
 
-    bio = fetch_single_player_bio(player_id, timeout_seconds)
+    bio, status_code = fetch_single_player_bio(player_id, timeout_seconds)
     if bio is None:
-        return True, "not_found"  # Not an error - player ID just doesn't exist
+        if status_code == 429:
+            return False, "rate_limited"
+        if status_code == 404:
+            return True, "not_found"  # Not an error - player ID just doesn't exist
+        return False, "error"
 
     upsert_player_bio(db_path, bio)
     return True, "fetched"
@@ -451,44 +520,60 @@ def _fetch_and_store_player_bio(
 
 def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
     """
-    Orchestrates fetching player bios for a range of player IDs.
+    Orchestrates fetching player bios. By default, collects player IDs from the
+    shots table. If start_player_id and end_player_id are set (non-zero), fetches
+    all IDs in that range instead.
     Returns (total_fetched, total_skipped, total_not_found, total_errors).
     """
     initialize_player_bio_database(config.db_path)
     configure_player_bio_rate_limit(config.request_delay_seconds)
 
-    # Load previous state to resume
-    state = _load_fetch_state(config.db_path)
-    last_completed = state.get("last_completed_player_id", 0)
-
-    # Determine start point
-    if config.force_refresh:
-        start_id = config.start_player_id
-        logging.info("Force refresh enabled: starting from player ID %d", start_id)
+    # Determine which player IDs to fetch
+    if config.start_player_id > 0 and config.end_player_id > 0:
+        if config.start_player_id > config.end_player_id:
+            logging.error("Invalid range: start %d > end %d", config.start_player_id, config.end_player_id)
+            return 0, 0, 0, 0
+        player_ids = list(range(config.start_player_id, config.end_player_id + 1))
+        logging.info("Fetching bios for %d IDs in range %d–%d", len(player_ids), config.start_player_id, config.end_player_id)
     else:
-        start_id = max(config.start_player_id, last_completed + 1)
-        if start_id > config.start_player_id:
-            logging.info("Resuming from player ID %d (last completed: %d)", start_id, last_completed)
+        player_ids = _collect_player_ids_from_shots(config.db_path)
+        if not player_ids:
+            return 0, 0, 0, 0
 
-    if start_id > config.end_player_id:
-        logging.info("No players to fetch: start_id %d > end_player_id %d", start_id, config.end_player_id)
+    # When not forcing refresh, skip IDs already in the players table
+    if not config.force_refresh:
+        with sqlite3.connect(config.db_path) as connection:
+            cursor = connection.cursor()
+            placeholders = ",".join("?" for _ in player_ids)
+            cursor.execute(
+                f"SELECT player_id FROM {PLAYER_BIO_TABLE} WHERE player_id IN ({placeholders})",
+                player_ids,
+            )
+            existing = {row[0] for row in cursor.fetchall()}
+
+        skipped = [pid for pid in player_ids if pid in existing]
+        to_fetch = [pid for pid in player_ids if pid not in existing]
+        logging.info(
+            "Skipping %d already-stored players, fetching %d new players",
+            len(skipped), len(to_fetch),
+        )
+        player_ids = to_fetch
+
+    total_players = len(player_ids)
+    if total_players == 0:
+        logging.info("All player bios already exist in the database. Nothing to do.")
         return 0, 0, 0, 0
 
-    player_ids = list(range(start_id, config.end_player_id + 1))
-    total_players = len(player_ids)
-
     logging.info(
-        "Fetching player bios for %d players (IDs %d to %d) with %d workers",
-        total_players,
-        start_id,
-        config.end_player_id,
-        config.max_workers,
+        "Fetching player bios for %d players with %d workers",
+        total_players, config.max_workers,
     )
 
     total_fetched = 0
     total_skipped = 0
     total_not_found = 0
     total_errors = 0
+    total_rate_limited = 0
     last_heartbeat = time.monotonic()
 
     def log_heartbeat(processed: int, current_id: int) -> None:
@@ -496,12 +581,13 @@ def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
         now = time.monotonic()
         if now - last_heartbeat >= PLAYER_BIO_HEARTBEAT_INTERVAL_SECONDS:
             logging.info(
-                "Player bio fetch progress: %d/%d processed, fetched=%d, skipped=%d, not_found=%d, errors=%d, current_id=%d",
+                "Player bio fetch progress: %d/%d processed, fetched=%d, skipped=%d, not_found=%d, rate_limited=%d, errors=%d, current_id=%d",
                 processed,
                 total_players,
                 total_fetched,
                 total_skipped,
                 total_not_found,
+                total_rate_limited,
                 total_errors,
                 current_id,
             )
@@ -511,8 +597,8 @@ def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
         cursor = connection.cursor()
         _save_fetch_state(
             cursor,
-            last_completed_player_id=start_id - 1,
-            last_attempted_player_id=start_id - 1,
+            last_completed_player_id=0,
+            last_attempted_player_id=0,
             total_fetched=0,
             total_skipped_existing=0,
             total_not_found=0,
@@ -522,91 +608,57 @@ def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
 
         try:
             if config.max_workers <= 1 or total_players <= 1:
-                # Sequential processing
-                for idx, player_id in enumerate(player_ids, 1):
-                    success, status = _fetch_and_store_player_bio(
-                        player_id, config.timeout_seconds, config.db_path, config.force_refresh
-                    )
-                    if not success:
-                        total_errors += 1
-                    elif status == "fetched":
-                        total_fetched += 1
-                    elif status == "skipped_existing":
-                        total_skipped += 1
-                    elif status == "not_found":
-                        total_not_found += 1
+                # Sequential processing with retry on rate-limit
+                remaining = list(player_ids)
+                retry_delay = config.request_delay_seconds * 4  # Start with a more conservative backoff
+                max_retries = 3
 
-                    # Update state periodically
-                    if idx % PLAYER_BIO_DB_COMMIT_INTERVAL == 0 or idx == total_players:
-                        _save_fetch_state(
-                            cursor,
-                            last_completed_player_id=player_id,
-                            last_attempted_player_id=player_id,
-                            total_fetched=total_fetched,
-                            total_skipped_existing=total_skipped,
-                            total_not_found=total_not_found,
-                            status="running",
+                for attempt in range(max_retries + 1):
+                    if not remaining:
+                        break
+
+                    if attempt > 0:
+                        logging.info(
+                            "Retry attempt %d/%d for %d rate-limited players (waiting %.1fs)...",
+                            attempt, max_retries, len(remaining), retry_delay,
                         )
-                        connection.commit()
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
 
-                    log_heartbeat(idx, player_id)
-
-            else:
-                # Parallel processing with ThreadPoolExecutor
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-
-                with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            _fetch_and_store_player_bio,
-                            player_id,
-                            config.timeout_seconds,
-                            config.db_path,
-                            config.force_refresh,
-                        ): player_id
-                        for player_id in player_ids
-                    }
-
-                    completed_count = 0
-                    for future in as_completed(futures):
-                        player_id = futures[future]
-                        completed_count += 1
-
-                        try:
-                            success, status = future.result()
-                            if not success:
-                                total_errors += 1
-                            elif status == "fetched":
-                                total_fetched += 1
-                            elif status == "skipped_existing":
-                                total_skipped += 1
-                            elif status == "not_found":
-                                total_not_found += 1
-                        except Exception as exc:
-                            logging.error("Error fetching player %d: %s", player_id, exc)
+                    still_remaining = []
+                    for idx, player_id in enumerate(remaining, 1):
+                        success, status = _fetch_and_store_player_bio(
+                            player_id, config.timeout_seconds, config.db_path, config.force_refresh
+                        )
+                        if status == "rate_limited":
+                            still_remaining.append(player_id)
+                        elif status == "fetched":
+                            total_fetched += 1
+                        elif status == "skipped_existing":
+                            total_skipped += 1
+                        elif status == "not_found":
+                            total_not_found += 1
+                        else:
                             total_errors += 1
 
-                        # Update state periodically
-                        if completed_count % PLAYER_BIO_DB_COMMIT_INTERVAL == 0 or completed_count == total_players:
-                            _save_fetch_state(
-                                cursor,
-                                last_completed_player_id=player_id,
-                                last_attempted_player_id=player_id,
-                                total_fetched=total_fetched,
-                                total_skipped_existing=total_skipped,
-                                total_not_found=total_not_found,
-                                status="running",
-                            )
-                            connection.commit()
+                        log_heartbeat(len(remaining), player_id)
 
-                        log_heartbeat(completed_count, player_id)
+                    remaining = still_remaining
+                    total_rate_limited += len(remaining)
 
-            # Final state update
+                if remaining:
+                    logging.warning(
+                        "Gave up on %d players after %d retries due to rate limiting: %s",
+                        len(remaining), max_retries, remaining[:10],
+                    )
+                    total_errors += len(remaining)
+
+                    # Final state update
             final_status = "complete" if total_errors == 0 else "partial"
             _save_fetch_state(
                 cursor,
-                last_completed_player_id=config.end_player_id,
-                last_attempted_player_id=config.end_player_id,
+                last_completed_player_id=player_ids[-1] if player_ids else 0,
+                last_attempted_player_id=player_ids[-1] if player_ids else 0,
                 total_fetched=total_fetched,
                 total_skipped_existing=total_skipped,
                 total_not_found=total_not_found,
@@ -617,8 +669,8 @@ def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
         except Exception:
             _save_fetch_state(
                 cursor,
-                last_completed_player_id=start_id - 1,
-                last_attempted_player_id=config.end_player_id,
+                last_completed_player_id=0,
+                last_attempted_player_id=player_ids[-1] if player_ids else 0,
                 total_fetched=total_fetched,
                 total_skipped_existing=total_skipped,
                 total_not_found=total_not_found,
@@ -628,7 +680,7 @@ def run_player_bio_fetch(config: PlayerBioConfig) -> tuple[int, int, int, int]:
             raise
 
     logging.info(
-        "Player bio fetch complete: fetched=%d, skipped_existing=%d, not_found=%d, errors=%d",
+        "Player bio fetch complete: fetched=%d, skipped_existing=%d, not_found=%d, rate_limited=%d, errors=%d",
         total_fetched,
         total_skipped,
         total_not_found,
@@ -680,13 +732,15 @@ def get_fetch_status(db_path: str) -> dict:
 def parse_args() -> argparse.Namespace:
     """CLI argument parser for player bio fetching."""
     parser = argparse.ArgumentParser(description="Fetch NHL player biographical data from NHL Web API.")
-    parser.add_argument("--start-player-id", type=int, default=1, help="Starting player ID (default: 1)")
-    parser.add_argument("--end-player-id", type=int, default=9999999, help="Ending player ID (default: 9999999)")
+    parser.add_argument("--start", type=int, default=0, metavar="ID",
+                        help="Start of player ID range. Default: collect IDs from shots table.")
+    parser.add_argument("--end", type=int, default=0, metavar="ID",
+                        help="End of player ID range. Requires --start.")
     parser.add_argument("--force-refresh", action="store_true", help="Re-fetch all players even if already in database")
     parser.add_argument("--timeout", type=int, default=PLAYER_BIO_DEFAULT_TIMEOUT_SECONDS, help="HTTP timeout in seconds")
     parser.add_argument("--max-workers", type=int, default=PLAYER_BIO_DEFAULT_MAX_WORKERS, help="Max concurrent workers")
     parser.add_argument("--request-delay", type=float, default=PLAYER_BIO_REQUEST_DELAY_SECONDS, help="Min delay between requests (seconds)")
-    parser.add_argument("--db-path", default="hockey_shots.db", help="SQLite database path")
+    parser.add_argument("--db-path", default="hockey_data.db", help="SQLite database path")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--status", action="store_true", help="Show current fetch status and exit")
     return parser.parse_args()
@@ -704,9 +758,13 @@ def main() -> None:
             print(f"  {key}: {value}")
         return
 
+    if (args.start > 0) != (args.end > 0):
+        logging.error("Both --start and --end must be provided together, or neither.")
+        return
+
     config = PlayerBioConfig(
-        start_player_id=args.start_player_id,
-        end_player_id=args.end_player_id,
+        start_player_id=args.start,
+        end_player_id=args.end,
         timeout_seconds=args.timeout,
         max_workers=args.max_workers,
         request_delay_seconds=args.request_delay,

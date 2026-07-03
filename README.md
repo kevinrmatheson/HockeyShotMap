@@ -64,7 +64,7 @@ By default, the script uses:
 - season `2013`
 - regular season game type (`02`)
 - game ids `0001` through `1271`
-- output database `hockey_shots.db`
+- output database `hockey_data.db`
 
 ## Setup
 
@@ -104,6 +104,24 @@ Capture NHL Edge snapshots for each scraped season:
 
 ```bash
 python Main.py --api-source both --capture-edge
+```
+
+Run an EDGE-only pass (no shot scraping):
+
+```bash
+python Main.py --api-source web --edge-only --capture-edge --season 2024
+```
+
+Run a deep EDGE-only pass (no shot scraping):
+
+```bash
+python Main.py --api-source web --edge-only --capture-edge-deep --season 2024
+```
+
+Run summary and deep EDGE in one pass (still no shot scraping):
+
+```bash
+python Main.py --api-source web --edge-only --capture-edge --capture-edge-deep --season 2024
 ```
 
 Capture the deeper Edge crawl too:
@@ -150,7 +168,7 @@ It also writes validation and calibration-monitoring diagnostics into SQLite so 
 After scraping data into SQLite, run:
 
 ```bash
-python Metrics.py --db-path hockey_shots.db --season 2024
+python Metrics.py --db-path hockey_data.db --season 2024
 ```
 
 Refresh behavior is season-aware and incremental:
@@ -184,19 +202,19 @@ Useful options:
 Example with explicit model controls:
 
 ```bash
-python Metrics.py --db-path hockey_shots.db --season 2024 --train-start-season 2022 --validation-split 0.2 --epochs 500 --xgb-max-depth 5
+python Metrics.py --db-path hockey_data.db --season 2024 --train-start-season 2022 --validation-split 0.2 --epochs 500 --xgb-max-depth 5
 ```
 
 Run a situation-only (no player identity) model:
 
 ```bash
-python Metrics.py --db-path hockey_shots.db --season 2024 --no-player-effects
+python Metrics.py --db-path hockey_data.db --season 2024 --no-player-effects
 ```
 
 Use temporal validation split (recommended for time-series data):
 
 ```bash
-python Metrics.py --db-path hockey_shots.db --season 2024 --validation-split-strategy temporal
+python Metrics.py --db-path hockey_data.db --season 2024 --validation-split-strategy temporal
 ```
 
 ### Player-adaptive model
@@ -260,7 +278,7 @@ Calibration note: sigmoid calibration (Platt scaling) learns a 1D correction fro
 The dashboard reads the database directly, so you can open it later without rerunning the scraper.
 
 ```bash
-python -m visualization.app --db-path hockey_shots.db
+python -m visualization.app --db-path hockey_data.db
 ```
 
 Then open the local URL printed in the terminal.
@@ -343,21 +361,23 @@ Export fields are preserved in this order:
 A separate module fetches and stores NHL player biographical data from the NHL Web API (`/v1/player/{id}/landing`). This is useful for enriching shot data with player attributes like height, weight, handedness, birth date, and draft info.
 
 ```bash
-# Fetch bios for a range of player IDs (resumable, rate-limited)
-python player_bio.py --start-player-id 1 --end-player-id 9999999 --db-path hockey_shots.db
+# Default: collect player IDs from the shots table and fetch their bios
+python player_bio.py --db-path hockey_data.db
 
-# Resume from last completed ID (automatic on re-run)
-python player_bio.py --start-player-id 1 --end-player-id 9999999 --db-path hockey_shots.db
+# Override: fetch a specific range of player IDs
+python player_bio.py --start 8440000 --end 8486000 --db-path hockey_data.db
 
-# Force re-fetch all players in range (overwrites existing)
-python player_bio.py --start-player-id 1 --end-player-id 9999999 --force-refresh --db-path hockey_shots.db
+# Force re-fetch all (overwrites existing)
+python player_bio.py --force-refresh --db-path hockey_data.db
 
 # Check current fetch status
-python player_bio.py --status --db-path hockey_shots.db
+python player_bio.py --status --db-path hockey_data.db
 ```
 
 Key features:
-- **Resumable**: Tracks last completed player ID in `player_bio_fetch_state` table; re-runs pick up where they left off
+- **Shot-driven**: By default, collects player IDs (shooters + goalies) from your existing shot data — no wasteful full-range scan
+- **Range override**: Use `--start` and `--end` to manually specify an ID range if needed
+- **Idempotent**: Skips players already stored; use `--force-refresh` to overwrite
 - **Rate limited**: 0.1s default delay between requests (configurable via `--request-delay`)
 - **Parallel**: 2 workers by default (`--max-workers`)
 - **Idempotent**: `INSERT OR REPLACE` on `player_id` primary key; skips existing unless `--force-refresh`

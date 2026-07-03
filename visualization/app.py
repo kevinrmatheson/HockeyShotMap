@@ -66,7 +66,7 @@ def create_app(db_path: str) -> Flask:
 
 def parse_args() -> argparse.Namespace:
    parser = argparse.ArgumentParser(description="Run the HockeyShotMap visualization app.")
-   parser.add_argument("--db-path", default="hockey_shots.db", help="Path to the SQLite shot database.")
+   parser.add_argument("--db-path", default="hockey_data.db", help="Path to the SQLite shot database.")
    parser.add_argument("--host", default="127.0.0.1", help="Host to bind the dashboard to.")
    parser.add_argument("--port", type=int, default=5000, help="Port to bind the dashboard to.")
    parser.add_argument("--debug", action="store_true", help="Run the Flask app in debug mode.")

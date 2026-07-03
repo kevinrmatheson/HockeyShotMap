@@ -1,6 +1,6 @@
 # Local SQLite artifacts
-hockey_shots.db
-hockey_shots.db-journal
+hockey_data.db
+hockey_data.db-journal
 *.db-journal
 
 # Python cache and bytecode

@@ -1388,6 +1388,65 @@ def capture_edge_deep_snapshots(db_path: str, season: str, game_type: str, timeo
    return total_snapshots
 
 
+def _load_team_codes_for_season(db_path: str, season: str) -> set[str]:
+   # Reuse previously scraped shot rows to discover teams for deep EDGE passes.
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+      cursor.execute(
+         """
+         SELECT DISTINCT UPPER(TRIM(team))
+         FROM shots
+         WHERE season = ?
+           AND team IS NOT NULL
+           AND TRIM(team) <> ''
+         """,
+         (season,),
+      )
+      return {row[0] for row in cursor.fetchall() if row and row[0]}
+
+
+def run_edge_capture_only(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int]:
+   # Execute EDGE collection without running the per-game shot scrape loop.
+   initialize_database(config.db_path)
+   configure_request_rate_limit(config.request_delay_seconds)
+
+   if "web" not in active_sources:
+      logging.info("Skipping EDGE-only capture for season %s because web source is disabled.", config.season)
+      return 0, 0
+
+   if not (capture_edge or capture_edge_deep):
+      logging.info("EDGE-only mode requested for season %s with no EDGE flags enabled.", config.season)
+      return 0, 0
+
+   edge_supported = edge_is_supported_for_season(config.season, config.game_type, config.timeout_seconds)
+   if not edge_supported:
+      logging.info("Season %s: skipping EDGE-only capture because season is not listed in seasonsWithEdgeStats.", config.season)
+      return 0, 0
+
+   edge_payloads_inserted = 0
+   edge_detail_payloads_inserted = 0
+
+   if capture_edge:
+      edge_payloads_inserted = capture_edge_summary_snapshots(
+         config.db_path,
+         config.season,
+         config.game_type,
+         config.timeout_seconds,
+      )
+
+   if capture_edge_deep:
+      team_codes = _load_team_codes_for_season(config.db_path, config.season)
+      edge_detail_payloads_inserted = capture_edge_deep_snapshots(
+         config.db_path,
+         config.season,
+         config.game_type,
+         config.timeout_seconds,
+         team_codes,
+      )
+
+   return edge_payloads_inserted, edge_detail_payloads_inserted
+
+
 def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int, int, int]:
    # Orchestrates fetch -> parse -> persist for a game range.
    initialize_database(config.db_path)
@@ -1657,20 +1716,21 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument(
       "--start-season",
       type=int,
-      default=COORDINATE_DATA_START_SEASON,
-      help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first coordinate-data season).",
+      default=None,
+      help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first coordinate-data season) when --season is not used.",
    )
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season for multi-season run. Defaults to current NHL season.")
    parser.add_argument("--api-source", default="both", choices=["web", "stats", "both"], help="Choose Web API, Stats REST API, or both.")
    parser.add_argument("--capture-edge", action="store_true", help="Capture NHL Edge summary payloads when web API is enabled.")
    parser.add_argument("--capture-edge-deep", action="store_true", help="Capture NHL Edge team and player detail payloads after each season.")
+   parser.add_argument("--edge-only", action="store_true", help="Run only EDGE capture flags for selected seasons without scraping shot events.")
    parser.add_argument("--game-type", default=REGULAR_SEASON, choices=[PRESEASON, REGULAR_SEASON, PLAYOFFS, ALLSTAR])
    parser.add_argument("--start-game", type=int, default=1)
    parser.add_argument("--end-game", type=int, default=1271)
    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds.")
    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum number of concurrent game fetch workers.")
    parser.add_argument("--request-delay", type=float, default=DEFAULT_REQUEST_DELAY_SECONDS, help="Minimum delay in seconds between API requests.")
-   parser.add_argument("--db-path", default="hockey_shots.db", help="SQLite database path.")
+   parser.add_argument("--db-path", default="hockey_data.db", help="SQLite database path.")
    parser.add_argument("--export-csv", default=None, help="Optional Tableau-compatible CSV export path.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
@@ -1688,10 +1748,13 @@ def main() -> None:
    if args.season is not None and (args.start_season is not None or args.end_season is not None):
       raise ValueError("Use either --season or --start-season/--end-season, not both.")
 
+   if args.edge_only and not (args.capture_edge or args.capture_edge_deep):
+      raise ValueError("--edge-only requires --capture-edge and/or --capture-edge-deep.")
+
    if args.season is not None:
       seasons_to_run = [str(args.season)]
    else:
-      resolved_start = args.start_season
+      resolved_start = args.start_season if args.start_season is not None else COORDINATE_DATA_START_SEASON
       logging.info("Using start season %s", resolved_start)
       seasons_to_run = season_range(resolved_start, args.end_season)
 
@@ -1713,12 +1776,22 @@ def main() -> None:
          db_path=args.db_path,
          export_csv=None,
       )
-      games_processed, rows_inserted, edge_payloads, edge_detail_payloads = run_season_scrape(
-         config,
-         active_sources,
-         args.capture_edge,
-         args.capture_edge_deep,
-      )
+      if args.edge_only:
+         edge_payloads, edge_detail_payloads = run_edge_capture_only(
+            config,
+            active_sources,
+            args.capture_edge,
+            args.capture_edge_deep,
+         )
+         games_processed = 0
+         rows_inserted = 0
+      else:
+         games_processed, rows_inserted, edge_payloads, edge_detail_payloads = run_season_scrape(
+            config,
+            active_sources,
+            args.capture_edge,
+            args.capture_edge_deep,
+         )
       total_games_processed += games_processed
       total_rows_inserted += rows_inserted
       total_edge_payloads += edge_payloads
