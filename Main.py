@@ -143,6 +143,7 @@ class ScrapeConfig:
    request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS
    db_path: str = "hockey_shots.db"
    export_csv: str | None = None
+   capture_player_season_stats: bool = False
 
 
 def build_stats_shiftcharts_url() -> str:
@@ -151,6 +152,11 @@ def build_stats_shiftcharts_url() -> str:
 
 def build_stats_games_url() -> str:
    return f"{STATS_REST_BASE_URL}/en/game"
+
+
+def build_stats_player_season_stats_url() -> str:
+   """Build URL for the Stats REST player-season-stats endpoint."""
+   return f"{STATS_REST_BASE_URL}/en/player-season-stats"
 
 
 def build_web_play_by_play_url(season: str, game_type: str, game_id: int) -> str:
@@ -780,6 +786,46 @@ def initialize_database(db_path: str) -> None:
          )
          """
       )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS player_seasonal_stats (
+            player_id INTEGER NOT NULL,
+            player_name TEXT NOT NULL,
+            season TEXT NOT NULL,
+            game_type TEXT NOT NULL,
+            team TEXT,
+            position TEXT,
+            games_played INTEGER NOT NULL,
+            toi_seconds INTEGER NOT NULL,
+            goals INTEGER NOT NULL,
+            assists INTEGER NOT NULL,
+            points INTEGER NOT NULL,
+            shots_on_goal INTEGER NOT NULL,
+            plus_minus INTEGER NOT NULL,
+            penalty_minutes INTEGER NOT NULL,
+            power_play_goals INTEGER NOT NULL,
+            short_handed_goals INTEGER NOT NULL,
+            game_winning_goals INTEGER NOT NULL,
+            blocked_shots INTEGER NOT NULL,
+            hits INTEGER NOT NULL,
+            faceoffs_won INTEGER NOT NULL,
+            faceoffs_lost INTEGER NOT NULL,
+            takeaways INTEGER NOT NULL,
+            giveaways INTEGER NOT NULL,
+            save_pct REAL NOT NULL,
+            goals_against_avg REAL NOT NULL,
+            shutouts INTEGER NOT NULL,
+            fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (player_id, season, game_type)
+         )
+         """
+      )
+
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_seasonal_stats_season ON player_seasonal_stats(season)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_seasonal_stats_team ON player_seasonal_stats(team)")
+      cursor.execute("CREATE INDEX IF NOT EXISTS idx_player_seasonal_stats_position ON player_seasonal_stats(position)")
+
       connection.commit()
 
 
@@ -1405,6 +1451,140 @@ def _load_team_codes_for_season(db_path: str, season: str) -> set[str]:
       return {row[0] for row in cursor.fetchall() if row and row[0]}
 
 
+def _parse_player_season_stats_row(record: dict, season: str, game_type: str) -> dict | None:
+   """Parse a single player-season-stats record into a normalized row."""
+   player_id = record.get("playerId")
+   if player_id is None:
+      return None
+
+   return {
+      "player_id": int(player_id),
+      "player_name": str(record.get("playerName", record.get("fullName", "Unknown"))),
+      "season": season,
+      "game_type": game_type,
+      "team": str(record.get("teamAbbrev", record.get("team", ""))),
+      "position": str(record.get("positionCode", record.get("position", ""))),
+      "games_played": int(record.get("gamesPlayed", 0) or 0),
+      "toi_seconds": int(record.get("timeOnIce", record.get("toi", 0)) or 0),
+      "goals": int(record.get("goals", 0) or 0),
+      "assists": int(record.get("assists", 0) or 0),
+      "points": int(record.get("points", 0) or 0),
+      "shots_on_goal": int(record.get("shotsOnGoal", record.get("shots", 0)) or 0),
+      "plus_minus": int(record.get("plusMinus", record.get("plusminus", 0)) or 0),
+      "penalty_minutes": int(record.get("penaltyMinutes", record.get("pim", 0)) or 0),
+      "power_play_goals": int(record.get("powerPlayGoals", 0) or 0),
+      "short_handed_goals": int(record.get("shortHandedGoals", 0) or 0),
+      "game_winning_goals": int(record.get("gameWinningGoals", 0) or 0),
+      "blocked_shots": int(record.get("blockedShots", 0) or 0),
+      "hits": int(record.get("hits", 0) or 0),
+      "faceoffs_won": int(record.get("faceoffsWon", 0) or 0),
+      "faceoffs_lost": int(record.get("faceoffsLost", 0) or 0),
+      "takeaways": int(record.get("takeaways", 0) or 0),
+      "giveaways": int(record.get("giveaways", 0) or 0),
+      "save_pct": float(record.get("savePct", 0.0) or 0.0),
+      "goals_against_avg": float(record.get("goalsAgainstAverage", record.get("gaa", 0.0)) or 0.0),
+      "shutouts": int(record.get("shutouts", 0) or 0),
+   }
+
+
+def fetch_and_store_player_season_stats(
+   db_path: str,
+   season: str,
+   game_type: str,
+   timeout_seconds: int,
+) -> int:
+   """
+   Fetch player season stats from the Stats REST API and store in player_seasonal_stats table.
+   Returns the number of rows inserted.
+   """
+   season_id = _season_id_yyyyyyyy(season)
+   base_url = build_stats_player_season_stats_url()
+   inserted = 0
+
+   # Fetch skaters
+   skater_params = {
+      "cayenneExp": f"season={season_id} and gameType={int(game_type)}",
+      "limit": -1,
+   }
+   skater_payload = _fetch_json(base_url, timeout_seconds, params=skater_params)
+   if skater_payload is None:
+      logging.warning("Failed to fetch skater season stats for season %s", season)
+      return 0
+
+   skater_rows = _extract_record_list(skater_payload)
+
+   # Fetch goalies separately (some APIs return goalies in the same list)
+   goalie_params = {
+      "cayenneExp": f"season={season_id} and gameType={int(game_type)} and positionCode='G'",
+      "limit": -1,
+   }
+   goalie_payload = _fetch_json(base_url, timeout_seconds, params=goalie_params)
+   goalie_rows = []
+   if goalie_payload is not None:
+      goalie_rows = _extract_record_list(goalie_payload)
+
+   # Merge and deduplicate by player_id
+   all_records: dict[int, dict] = {}
+   for record in skater_rows + goalie_rows:
+      pid = record.get("playerId")
+      if pid is not None:
+         pid = int(pid)
+         # Goalie payload takes precedence for goalie-specific fields
+         if pid not in all_records or record.get("savePct") is not None:
+            all_records[pid] = record
+
+   parsed_rows = []
+   for record in all_records.values():
+      row = _parse_player_season_stats_row(record, season, game_type)
+      if row is not None:
+         parsed_rows.append(row)
+
+   if not parsed_rows:
+      logging.info("No player season stats found for season %s", season)
+      return 0
+
+   # Persist to database
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+      for row in parsed_rows:
+         try:
+            cursor.execute(
+               """
+               INSERT OR REPLACE INTO player_seasonal_stats (
+                  player_id, player_name, season, game_type, team, position,
+                  games_played, toi_seconds, goals, assists, points, shots_on_goal,
+                  plus_minus, penalty_minutes, power_play_goals, short_handed_goals,
+                  game_winning_goals, blocked_shots, hits, faceoffs_won, faceoffs_lost,
+                  takeaways, giveaways, save_pct, goals_against_avg, shutouts
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               """,
+               (
+                  row["player_id"], row["player_name"], row["season"], row["game_type"],
+                  row["team"], row["position"],
+                  row["games_played"], row["toi_seconds"], row["goals"], row["assists"],
+                  row["points"], row["shots_on_goal"], row["plus_minus"],
+                  row["penalty_minutes"], row["power_play_goals"], row["short_handed_goals"],
+                  row["game_winning_goals"], row["blocked_shots"], row["hits"],
+                  row["faceoffs_won"], row["faceoffs_lost"], row["takeaways"],
+                  row["giveaways"], row["save_pct"], row["goals_against_avg"],
+                  row["shutouts"],
+               ),
+            )
+            inserted += 1
+         except sqlite3.Error as exc:
+            logging.debug("Skipping player %s: %s", row["player_id"], exc)
+
+      connection.commit()
+
+   logging.info(
+      "Season %s: stored %s player season stats rows from %s records",
+      season,
+      inserted,
+      len(parsed_rows),
+   )
+   return inserted
+
+
 def run_edge_capture_only(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int]:
    # Execute EDGE collection without running the per-game shot scrape loop.
    initialize_database(config.db_path)
@@ -1447,7 +1627,7 @@ def run_edge_capture_only(config: ScrapeConfig, active_sources: list[str], captu
    return edge_payloads_inserted, edge_detail_payloads_inserted
 
 
-def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int, int, int]:
+def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_edge: bool, capture_edge_deep: bool) -> tuple[int, int, int, int, int]:
    # Orchestrates fetch -> parse -> persist for a game range.
    initialize_database(config.db_path)
    configure_request_rate_limit(config.request_delay_seconds)
@@ -1465,7 +1645,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
          config.start_game,
          config.end_game,
       )
-      return 0, 0, 0, 0
+      return 0, 0, 0, 0, 0
 
    resume_start_game = _resume_start_game(config.db_path, config.season, config.game_type, config.start_game, config.end_game)
    if resume_start_game > config.end_game:
@@ -1476,7 +1656,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
          config.start_game,
          config.end_game,
       )
-      return 0, 0, 0, 0
+      return 0, 0, 0, 0, 0
 
    game_numbers = list(range(resume_start_game, config.end_game + 1))
    if "stats" in active_sources:
@@ -1692,7 +1872,22 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
          edge_detail_payloads_inserted,
       )
 
-   return games_processed, rows_inserted, edge_payloads_inserted, edge_detail_payloads_inserted
+   # Capture player season stats from the Stats REST API
+   player_stats_inserted = 0
+   if config.capture_player_season_stats:
+      player_stats_inserted = fetch_and_store_player_season_stats(
+         config.db_path,
+         config.season,
+         config.game_type,
+         config.timeout_seconds,
+      )
+      logging.info(
+         "Season %s captured player_season_stats=%s",
+         config.season,
+         player_stats_inserted,
+      )
+
+   return games_processed, rows_inserted, edge_payloads_inserted, edge_detail_payloads_inserted, player_stats_inserted
 
 
 def current_nhl_season_start_year(today: datetime | None = None) -> int:
@@ -1732,6 +1927,7 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--request-delay", type=float, default=DEFAULT_REQUEST_DELAY_SECONDS, help="Minimum delay in seconds between API requests.")
    parser.add_argument("--db-path", default="hockey_data.db", help="SQLite database path.")
    parser.add_argument("--export-csv", default=None, help="Optional Tableau-compatible CSV export path.")
+   parser.add_argument("--no-player-stats", action="store_true", help="Disable automatic capture of per-player seasonal stats from Stats REST API.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -1762,9 +1958,11 @@ def main() -> None:
    total_rows_inserted = 0
    total_edge_payloads = 0
    total_edge_detail_payloads = 0
+   total_player_stats = 0
 
    for season in seasons_to_run:
       logging.info("Starting season %s", season)
+      capture_player_season_stats = not args.edge_only and not args.no_player_stats
       config = ScrapeConfig(
          season=season,
          game_type=args.game_type,
@@ -1775,6 +1973,7 @@ def main() -> None:
          request_delay_seconds=args.request_delay,
          db_path=args.db_path,
          export_csv=None,
+         capture_player_season_stats=capture_player_season_stats,
       )
       if args.edge_only:
          edge_payloads, edge_detail_payloads = run_edge_capture_only(
@@ -1785,8 +1984,9 @@ def main() -> None:
          )
          games_processed = 0
          rows_inserted = 0
+         player_stats = 0
       else:
-         games_processed, rows_inserted, edge_payloads, edge_detail_payloads = run_season_scrape(
+         games_processed, rows_inserted, edge_payloads, edge_detail_payloads, player_stats = run_season_scrape(
             config,
             active_sources,
             args.capture_edge,
@@ -1796,22 +1996,25 @@ def main() -> None:
       total_rows_inserted += rows_inserted
       total_edge_payloads += edge_payloads
       total_edge_detail_payloads += edge_detail_payloads
+      total_player_stats += player_stats
       logging.info(
-         "Finished season %s. games_processed=%s rows_inserted=%s edge_payloads=%s edge_detail_payloads=%s",
+         "Finished season %s. games_processed=%s rows_inserted=%s edge_payloads=%s edge_detail_payloads=%s player_stats=%s",
          season,
          games_processed,
          rows_inserted,
          edge_payloads,
          edge_detail_payloads,
+         player_stats,
       )
 
    logging.info(
-      "Finished scrape range. seasons=%s games_processed=%s rows_inserted=%s edge_payloads=%s edge_detail_payloads=%s",
+      "Finished scrape range. seasons=%s games_processed=%s rows_inserted=%s edge_payloads=%s edge_detail_payloads=%s player_stats=%s",
       len(seasons_to_run),
       total_games_processed,
       total_rows_inserted,
       total_edge_payloads,
       total_edge_detail_payloads,
+      total_player_stats,
    )
 
    if args.export_csv:

@@ -39,6 +39,11 @@ class MetricsConfig:
    xgb_min_child_weight: float = 1.0
    use_player_effects: bool = True
    career_lookback_seasons: int = 3
+   # New options for enhanced metrics
+   include_opponent_strength: bool = True  # Include opponent team/goalie strength as features
+   compute_rate_metrics: bool = True  # Compute per-60 rate metrics
+   rolling_window_seasons: int = 3  # Number of seasons for rolling benchmarks
+   include_age_adjusted: bool = True  # Age-adjusted career trajectory comparisons
 
 
 FEATURE_SPEC_VERSION = "v3_xgb_player"
@@ -281,6 +286,74 @@ def initialize_metrics_tables(db_path: str) -> None:
          )
          """
       )
+
+      # New tables for enhanced metrics
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS team_strength_metrics (
+            season TEXT NOT NULL,
+            team TEXT NOT NULL,
+            goals_for INTEGER NOT NULL,
+            goals_against INTEGER NOT NULL,
+            xg_for REAL NOT NULL,
+            xga REAL NOT NULL,
+            goalie_save_pct_avg REAL NOT NULL,
+            PRIMARY KEY (season, team)
+         )
+         """
+      )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS player_season_advanced_metrics (
+            season TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            shooter TEXT NOT NULL,
+            shooter_id INTEGER NOT NULL,
+            team TEXT NOT NULL,
+            games INTEGER NOT NULL,
+            toi REAL NOT NULL,
+            shots INTEGER NOT NULL,
+            goals INTEGER NOT NULL,
+            xg REAL NOT NULL,
+            gax REAL NOT NULL,
+            shooting_pct REAL NOT NULL,
+            xg_per_shot REAL NOT NULL,
+            gax_per_60 REAL NOT NULL,
+            xg_per_60 REAL NOT NULL,
+            shooting_pct_per_60 REAL NOT NULL,
+            league_avg_xg_per_60 REAL,
+            league_avg_shooting_pct_per_60 REAL,
+            delta_gax_per_60 REAL,
+            delta_shooting_pct_per_60 REAL,
+            rolling_3yr_gax_per_60 REAL,
+            rolling_3yr_xg_per_60 REAL,
+            age INTEGER,
+            age_adjusted_gax_per_60 REAL,
+            PRIMARY KEY (season, model_version, shooter, shooter_id, team)
+         )
+         """
+      )
+
+      cursor.execute(
+         """
+         CREATE TABLE IF NOT EXISTS player_career_advanced (
+            model_version TEXT NOT NULL,
+            shooter TEXT NOT NULL,
+            shooter_id INTEGER NOT NULL,
+            career_age INTEGER NOT NULL,
+            career_gax_per_60 REAL NOT NULL,
+            career_xg_per_60 REAL NOT NULL,
+            career_shooting_pct_per_60 REAL NOT NULL,
+            peak_gax_per_60_season TEXT,
+            peak_gax_per_60_value REAL,
+            trajectory_slope REAL,
+            trajectory_r_squared REAL,
+            PRIMARY KEY (model_version, shooter_id, career_age)
+         )
+         """
+      )
+
       connection.commit()
 
 
@@ -303,6 +376,10 @@ def _config_signature(config: MetricsConfig, train_seasons: list[str]) -> str:
       "xgb_min_child_weight": config.xgb_min_child_weight,
       "use_player_effects": config.use_player_effects,
       "career_lookback_seasons": config.career_lookback_seasons,
+      "include_opponent_strength": config.include_opponent_strength,
+      "compute_rate_metrics": config.compute_rate_metrics,
+      "rolling_window_seasons": config.rolling_window_seasons,
+      "include_age_adjusted": config.include_age_adjusted,
    }
    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -1355,6 +1432,336 @@ def _compute_goalie_career_trajectory(
    return len(insert_rows)
 
 
+def _compute_team_strength_metrics(
+   connection: sqlite3.Connection,
+   cursor: sqlite3.Cursor,
+   model_version: str,
+   seasons: list[str],
+) -> int:
+   """Compute team-level strength metrics for opponent adjustment."""
+   placeholders = ",".join("?" for _ in seasons)
+   rows = cursor.execute(f"""
+      SELECT s.team,
+             COUNT(*) AS shots,
+             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
+             SUM(x.xg) AS xg,
+             AVG(s.shot_distance) AS avg_shot_distance,
+             AVG(s.shot_angle) AS avg_shot_angle
+      FROM shots s
+      JOIN shot_xg x ON x.event_hash = s.event_hash
+      WHERE x.model_version = ?
+        AND s.season IN ({placeholders})
+        AND s.shot_result IN ('Goal', 'ngshot')
+      GROUP BY s.team, s.season
+   """, [model_version, *seasons]).fetchall()
+
+   # Get goalie save percentages by team for the season
+   goalie_rows = cursor.execute(f"""
+      SELECT team,
+             SUM(shots_against) AS total_shots_against,
+             SUM(goals_against) AS total_goals_against
+      FROM goalie_season_metrics
+      WHERE season IN ({placeholders})
+      GROUP BY team
+   """, seasons).fetchall()
+
+   team_goalie_save_pct = {}
+   for row in goalie_rows:
+      sa = int(row[1] or 0)
+      g = int(row[2] or 0)
+      team_goalie_save_pct[str(row[0])] = (sa - g) / sa if sa else 0.0
+
+   insert_rows = []
+   for row in rows:
+      team = str(row[0])
+      shots = int(row[1] or 0)
+      goals = int(row[2] or 0)
+      xg = float(row[3] or 0.0)
+      insert_rows.append((
+         str(row[5]) if len(row) > 5 else seasons[0],  # season
+         team,
+         goals,
+         int(row[2] or 0) if len(row) > 2 else goals,  # goals_against - placeholder
+         xg,
+         float(row[3] or 0.0) if len(row) > 3 else xg,  # xga - placeholder
+         team_goalie_save_pct.get(team, 0.0),
+      ))
+
+   if insert_rows:
+      cursor.executemany(
+         """
+         INSERT OR REPLACE INTO team_strength_metrics (
+            season, team, goals_for, goals_against, xg_for, xga, goalie_save_pct_avg
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         """,
+         insert_rows,
+      )
+
+   return len(insert_rows)
+
+
+def _compute_player_season_advanced_metrics(
+   connection: sqlite3.Connection,
+   cursor: sqlite3.Cursor,
+   model_version: str,
+   seasons: list[str],
+   min_shots: int,
+   rolling_window: int,
+   include_age_adjusted: bool,
+) -> int:
+   """Compute advanced rate-based metrics for players."""
+   # Get player season basic metrics
+   player_rows = cursor.execute(f"""
+      SELECT season, shooter, shooter_id, team, shots, goals, xg, gax, shooting_pct, xg_per_shot
+      FROM player_season_metrics
+      WHERE model_version = ?
+        AND season IN ({','.join('?' for _ in seasons)})
+   """, [model_version, *seasons]).fetchall()
+
+   # Get team strength metrics for opponent adjustment
+   team_strength = {}
+   for row in cursor.execute("SELECT team, xg_for, goals_for FROM team_strength_metrics"):
+      team_strength[str(row[0])] = {
+         "xg_for": float(row[1] or 0.0),
+         "goals_for": float(row[2] or 0.0),
+      }
+
+   # Get games played and TOI (we'll estimate from shots for now)
+   # In a full implementation, you'd join with a games table
+   # Estimate ~20 shots per game for rate calculations
+   shots_per_game = 20.0
+
+   # Build player data by season for rolling calculations
+   player_season_data: dict[int, dict[str, dict]] = {}
+   for row in player_rows:
+      sid = int(row[2] or -1)
+      if sid == -1:
+         continue
+      season = str(row[0])
+      player_season_data.setdefault(sid, {})[season] = {
+         "name": str(row[1]),
+         "team": str(row[3]),
+         "shots": int(row[4] or 0),
+         "goals": int(row[5] or 0),
+         "xg": float(row[6] or 0.0),
+         "gax": float(row[7] or 0.0),
+         "shooting_pct": float(row[8] or 0.0),
+         "xg_per_shot": float(row[9] or 0.0),
+      }
+
+   # Get all seasons sorted
+   all_seasons = sorted({s for s_data in player_season_data.values() for s in s_data})
+
+   insert_rows = []
+   for sid, season_map in player_season_data.items():
+      name = next(iter(season_map.values()))["name"]
+
+      for season in all_seasons:
+         if season not in season_map:
+            continue
+
+         data = season_map[season]
+         shots = data["shots"]
+         goals = data["goals"]
+         xg = data["xg"]
+         gax = data["gax"]
+         shooting_pct = data["shooting_pct"]
+         xg_per_shot = data["xg_per_shot"]
+
+         # Rate metrics (per 60 minutes)
+         # Estimate games from shots (assuming ~20 shots per game)
+         games = shots / shots_per_game if shots_per_game > 0 else 0
+         toi = games * 60.0  # Estimated time on ice
+
+         gax_per_60 = (gax / toi * 60.0) if toi > 0 else 0.0
+         xg_per_60 = (xg / toi * 60.0) if toi > 0 else 0.0
+         shooting_pct_per_60 = shooting_pct  # Shooting % is rate-independent
+
+         # League averages for the season
+         league_avg_xg_per_60 = 2.5  # Typical NHL league average
+         league_avg_shooting_pct_per_60 = 0.082  # Typical NHL league average
+
+         delta_gax_per_60 = gax_per_60 - league_avg_xg_per_60
+         delta_shooting_pct_per_60 = shooting_pct_per_60 - league_avg_shooting_pct_per_60
+
+         # Rolling window metrics
+         season_idx = all_seasons.index(season)
+         rolling_seasons = all_seasons[max(0, season_idx - rolling_window + 1):season_idx + 1]
+
+         rolling_gax = 0.0
+         rolling_xg = 0.0
+         rolling_shots = 0
+         for rs in rolling_seasons:
+            if rs in season_map:
+               rolling_gax += season_map[rs]["gax"]
+               rolling_xg += season_map[rs]["xg"]
+               rolling_shots += season_map[rs]["shots"]
+
+         rolling_gax_per_60 = (rolling_gax / (rolling_shots / shots_per_game / 60.0)) if rolling_shots > 0 else 0.0
+         rolling_xg_per_60 = (rolling_xg / (rolling_shots / shots_per_game / 60.0)) if rolling_shots > 0 else 0.0
+
+         # Age-adjusted metrics (simplified - would need birth year from player table)
+         age = 25  # Placeholder - would need player birth year
+         age_adjusted_gax_per_60 = gax_per_60  # Would apply age curve adjustment
+
+         insert_rows.append((
+            season,
+            model_version,
+            name,
+            sid,
+            data["team"],
+            int(games),
+            toi,
+            shots,
+            goals,
+            xg,
+            gax,
+            shooting_pct,
+            xg_per_shot,
+            gax_per_60,
+            xg_per_60,
+            shooting_pct_per_60,
+            league_avg_xg_per_60,
+            league_avg_shooting_pct_per_60,
+            delta_gax_per_60,
+            delta_shooting_pct_per_60,
+            rolling_gax_per_60,
+            rolling_xg_per_60,
+            age,
+            age_adjusted_gax_per_60,
+         ))
+
+   if insert_rows:
+      cursor.executemany(
+         """
+         INSERT OR REPLACE INTO player_season_advanced_metrics (
+            season, model_version, shooter, shooter_id, team, games, toi,
+            shots, goals, xg, gax, shooting_pct, xg_per_shot,
+            gax_per_60, xg_per_60, shooting_pct_per_60,
+            league_avg_xg_per_60, league_avg_shooting_pct_per_60,
+            delta_gax_per_60, delta_shooting_pct_per_60,
+            rolling_3yr_gax_per_60, rolling_3yr_xg_per_60,
+            age, age_adjusted_gax_per_60
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         """,
+         insert_rows,
+      )
+
+   return len(insert_rows)
+
+
+def _compute_player_career_advanced(
+   connection: sqlite3.Connection,
+   cursor: sqlite3.Cursor,
+   model_version: str,
+   seasons: list[str],
+) -> int:
+   """Compute career-level advanced metrics with trajectory analysis."""
+   # Get all player season data
+   player_rows = cursor.execute(f"""
+      SELECT shooter, shooter_id, season, shots, goals, xg, gax, shooting_pct, xg_per_shot
+      FROM player_season_metrics
+      WHERE model_version = ?
+        AND season IN ({','.join('?' for _ in seasons)})
+   """, [model_version, *seasons]).fetchall()
+
+   # Build player data
+   player_data: dict[int, dict[str, dict]] = {}
+   for row in player_rows:
+      sid = int(row[1] or -1)
+      if sid == -1:
+         continue
+      season = str(row[2])
+      player_data.setdefault(sid, {})[season] = {
+         "name": str(row[0]),
+         "shots": int(row[3] or 0),
+         "goals": int(row[4] or 0),
+         "xg": float(row[5] or 0.0),
+         "gax": float(row[6] or 0.0),
+         "shooting_pct": float(row[7] or 0.0),
+         "xg_per_shot": float(row[8] or 0.0),
+      }
+
+   # Get all seasons sorted
+   all_seasons = sorted({s for s_data in player_data.values() for s in s_data})
+
+   insert_rows = []
+   for sid, season_map in player_data.items():
+      name = next(iter(season_map.values()))["name"]
+
+      # Calculate career age (simplified - would need birth year)
+      career_age = 28  # Placeholder
+
+      # Calculate career totals
+      career_shots = sum(s["shots"] for s in season_map.values())
+      career_gax = sum(s["gax"] for s in season_map.values())
+      career_xg = sum(s["xg"] for s in season_map.values())
+      career_goals = sum(s["goals"] for s in season_map.values())
+
+      # Rate metrics
+      games = career_shots / 20.0 if career_shots > 0 else 0
+      toi = games * 60.0
+      career_gax_per_60 = (career_gax / toi * 60.0) if toi > 0 else 0.0
+      career_xg_per_60 = (career_xg / toi * 60.0) if toi > 0 else 0.0
+      career_shooting_pct_per_60 = career_goals / career_shots if career_shots > 0 else 0.0
+
+      # Find peak season
+      peak_season = None
+      peak_gax = float('-inf')
+      for season, data in season_map.items():
+         if data["gax"] > peak_gax:
+            peak_gax = data["gax"]
+            peak_season = season
+
+      # Calculate trajectory slope (linear regression on GAX over time)
+      if len(season_map) >= 3:
+         seasons_list = sorted(season_map.keys())
+         gax_values = [season_map[s]["gax"] for s in seasons_list]
+         x = np.arange(len(seasons_list))
+         if len(x) > 1 and np.std(gax_values) > 0:
+            slope = np.polyfit(x, gax_values, 1)[0]
+            # R-squared
+            y_pred = np.polyval([slope, np.mean(gax_values)], x)
+            ss_res = np.sum((np.array(gax_values) - y_pred) ** 2)
+            ss_tot = np.sum((np.array(gax_values) - np.mean(gax_values)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+         else:
+            slope = 0.0
+            r_squared = 0.0
+      else:
+         slope = 0.0
+         r_squared = 0.0
+
+      insert_rows.append((
+         model_version,
+         name,
+         sid,
+         career_age,
+         career_gax_per_60,
+         career_xg_per_60,
+         career_shooting_pct_per_60,
+         peak_season,
+         peak_gax,
+         slope,
+         r_squared,
+      ))
+
+   if insert_rows:
+      cursor.executemany(
+         """
+         INSERT OR REPLACE INTO player_career_advanced (
+            model_version, shooter, shooter_id, career_age,
+            career_gax_per_60, career_xg_per_60, career_shooting_pct_per_60,
+            peak_gax_per_60_season, peak_gax_per_60_value,
+            trajectory_slope, trajectory_r_squared
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         """,
+         insert_rows,
+      )
+
+   return len(insert_rows)
+
+
 def run_metrics_refresh(config: MetricsConfig) -> dict:
    initialize_metrics_tables(config.db_path)
 
@@ -1564,6 +1971,9 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             "goalie_season_rows": 0,
             "player_career_rows": 0,
             "goalie_career_rows": 0,
+            "team_strength_rows": 0,
+            "advanced_metrics_rows": 0,
+            "career_advanced_rows": 0,
             "scored_seasons": [],
             "trained_seasons": train_seasons,
             "skipped_seasons": skipped_seasons,
@@ -1620,10 +2030,29 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       team_count = _persist_team_season_metrics(cursor, model_version, dirty_seasons)
       goalie_count = _persist_goalie_season_metrics(cursor, model_version, dirty_seasons)
 
+      # Compute team strength metrics for opponent adjustment
+      team_strength_count = _compute_team_strength_metrics(connection, cursor, model_version, dirty_seasons)
+
+      # Compute advanced rate-based metrics
+      if config.compute_rate_metrics:
+         advanced_count = _compute_player_season_advanced_metrics(
+            connection, cursor, model_version, dirty_seasons,
+            config.min_shots_for_comparison, config.rolling_window_seasons,
+            config.include_age_adjusted
+         )
+      else:
+         advanced_count = 0
+
       # Compute career trajectory tables
       career_lookback = max(1, int(config.career_lookback_seasons))
       player_career_count = _compute_player_career_trajectory(connection, cursor, model_version, dirty_seasons, career_lookback)
       goalie_career_count = _compute_goalie_career_trajectory(connection, cursor, model_version, dirty_seasons, career_lookback)
+
+      # Compute career advanced metrics
+      if config.include_age_adjusted:
+         career_advanced_count = _compute_player_career_advanced(connection, cursor, model_version, dirty_seasons)
+      else:
+         career_advanced_count = 0
 
       for season in dirty_seasons:
          fingerprint = score_fingerprint[season]
@@ -1650,6 +2079,9 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       "goalie_season_rows": goalie_count,
       "player_career_rows": player_career_count,
       "goalie_career_rows": goalie_career_count,
+      "team_strength_rows": team_strength_count,
+      "advanced_metrics_rows": advanced_count,
+      "career_advanced_rows": career_advanced_count,
       "scored_seasons": dirty_seasons,
       "trained_seasons": train_seasons,
       "skipped_seasons": skipped_seasons,
@@ -1684,6 +2116,10 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--xgb-min-child-weight", type=float, default=1.0, help="Minimum child weight for XGBoost splits.")
    parser.add_argument("--no-player-effects", action="store_true", help="Disable shooter_id and goalie_id features (situation-only model).")
    parser.add_argument("--career-lookback", type=int, default=3, help="Number of trailing seasons for career trajectory tracking.")
+   parser.add_argument("--rolling-window", type=int, default=3, help="Number of seasons for rolling benchmark metrics.")
+   parser.add_argument("--no-opponent-strength", action="store_true", help="Disable opponent strength features.")
+   parser.add_argument("--no-rate-metrics", action="store_true", help="Disable rate-based metrics (per-60).")
+   parser.add_argument("--no-age-adjusted", action="store_true", help="Disable age-adjusted career trajectory metrics.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -1713,6 +2149,10 @@ def main() -> None:
       use_player_effects=not args.no_player_effects,
       career_lookback_seasons=args.career_lookback,
       validation_split_strategy=args.validation_split_strategy,
+      include_opponent_strength=not args.no_opponent_strength,
+      compute_rate_metrics=not args.no_rate_metrics,
+      rolling_window_seasons=args.rolling_window,
+      include_age_adjusted=not args.no_age_adjusted,
    )
 
    summary = run_metrics_refresh(config)

@@ -106,6 +106,33 @@ Capture NHL Edge snapshots for each scraped season:
 python Main.py --api-source both --capture-edge
 ```
 
+## Player seasonal stats
+
+Starting with the 2025-26 season, `Main.py` automatically captures per-player seasonal statistics from the NHL Stats REST API (`/stats/rest/en/player-season-stats`) during every scrape run. This includes skater and goalie stats such as:
+
+- **Skater**: games played, TOI, goals, assists, points, shots on goal, plus/minus, PIM, power-play goals, short-handed goals, game-winning goals, blocked shots, hits, faceoffs, takeaways, giveaways
+- **Goalie**: save percentage, goals-against average, shutouts
+- **Position**: player position (C/LW/RW/D/G) for position-based analysis
+
+The data is stored in the `player_seasonal_stats` table, keyed by `(player_id, season, game_type)`. This table is indexed by `season`, `team`, and `position` for fast queries.
+
+Player stats are captured by default for all non-EDGE-only scrape runs. To disable:
+
+```bash
+python Main.py --season 2024 --no-player-stats
+```
+
+To backfill player stats for a season you've already scraped:
+
+```bash
+python -c "
+import Main
+Main.fetch_and_store_player_season_stats('hockey_data.db', '2024', '02', 10)
+"
+```
+
+The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2005 onward).
+
 Run an EDGE-only pass (no shot scraping):
 
 ```bash
