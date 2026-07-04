@@ -156,9 +156,14 @@ def build_stats_games_url() -> str:
    return f"{STATS_REST_BASE_URL}/en/game"
 
 
-def build_stats_player_season_stats_url() -> str:
-   """Build URL for the Stats REST player-season-stats endpoint."""
-   return f"{STATS_REST_BASE_URL}/en/player-season-stats"
+def build_stats_skater_summary_url() -> str:
+   """Build URL for the Stats REST skater summary endpoint."""
+   return f"{STATS_REST_BASE_URL}/en/skater/summary"
+
+
+def build_stats_goalie_summary_url() -> str:
+   """Build URL for the Stats REST goalie summary endpoint."""
+   return f"{STATS_REST_BASE_URL}/en/goalie/summary"
 
 
 def build_web_play_by_play_url(season: str, game_type: str, game_id: int) -> str:
@@ -1542,23 +1547,39 @@ def _parse_player_season_stats_row(record: dict, season: str, game_type: str) ->
    if player_id is None:
       return None
 
+   games_played = int(record.get("gamesPlayed", 0) or 0)
+   toi_seconds = _coerce_int(record.get("timeOnIce", record.get("toi")))
+   if toi_seconds is None:
+      toi_per_game = _coerce_float(record.get("timeOnIcePerGame"))
+      toi_seconds = int((toi_per_game or 0.0) * games_played)
+
+   position = _normalize_text(record.get("positionCode") or record.get("position"))
+   if not position and record.get("goalieFullName"):
+      position = "G"
+
    return {
       "player_id": int(player_id),
-      "player_name": str(record.get("playerName", record.get("fullName", "Unknown"))),
+      "player_name": str(
+         record.get("playerName")
+         or record.get("fullName")
+         or record.get("skaterFullName")
+         or record.get("goalieFullName")
+         or "Unknown"
+      ),
       "season": season,
       "game_type": game_type,
-      "team": str(record.get("teamAbbrev", record.get("team", ""))),
-      "position": str(record.get("positionCode", record.get("position", ""))),
-      "games_played": int(record.get("gamesPlayed", 0) or 0),
-      "toi_seconds": int(record.get("timeOnIce", record.get("toi", 0)) or 0),
+      "team": str(record.get("teamAbbrev", record.get("teamAbbrevs", record.get("team", "")))),
+      "position": str(position or ""),
+      "games_played": games_played,
+      "toi_seconds": int(toi_seconds or 0),
       "goals": int(record.get("goals", 0) or 0),
       "assists": int(record.get("assists", 0) or 0),
       "points": int(record.get("points", 0) or 0),
       "shots_on_goal": int(record.get("shotsOnGoal", record.get("shots", 0)) or 0),
       "plus_minus": int(record.get("plusMinus", record.get("plusminus", 0)) or 0),
       "penalty_minutes": int(record.get("penaltyMinutes", record.get("pim", 0)) or 0),
-      "power_play_goals": int(record.get("powerPlayGoals", 0) or 0),
-      "short_handed_goals": int(record.get("shortHandedGoals", 0) or 0),
+      "power_play_goals": int(record.get("powerPlayGoals", record.get("ppGoals", 0)) or 0),
+      "short_handed_goals": int(record.get("shortHandedGoals", record.get("shGoals", 0)) or 0),
       "game_winning_goals": int(record.get("gameWinningGoals", 0) or 0),
       "blocked_shots": int(record.get("blockedShots", 0) or 0),
       "hits": int(record.get("hits", 0) or 0),
@@ -1582,31 +1603,39 @@ def fetch_and_store_player_season_stats(
    Fetch player season stats from the Stats REST API and store in player_seasonal_stats table.
    Returns the number of rows inserted.
    """
-   season_id = _season_id_yyyyyyyy(season)
-   base_url = build_stats_player_season_stats_url()
+   season_id = int(_season_id_yyyyyyyy(season))
+   skater_url = build_stats_skater_summary_url()
+   goalie_url = build_stats_goalie_summary_url()
    inserted = 0
 
-   # Fetch skaters
+   # New Stats REST route names use seasonId/gameTypeId with skater/goalie summary endpoints.
    skater_params = {
-      "cayenneExp": f"season={season_id} and gameType={int(game_type)}",
+      "cayenneExp": f"seasonId={season_id} and gameTypeId={int(game_type)}",
       "limit": -1,
    }
-   skater_payload = _fetch_json(base_url, timeout_seconds, params=skater_params)
+   skater_payload = _fetch_json(skater_url, timeout_seconds, params=skater_params)
    if skater_payload is None:
-      logging.warning("Failed to fetch skater season stats for season %s", season)
-      return 0
+      logging.warning("Failed to fetch skater season stats for season %s (game_type=%s)", season, game_type)
 
    skater_rows = _extract_record_list(skater_payload)
 
-   # Fetch goalies separately (some APIs return goalies in the same list)
+   # Fetch goalies separately; this endpoint provides savePct/GAA fields.
    goalie_params = {
-      "cayenneExp": f"season={season_id} and gameType={int(game_type)} and positionCode='G'",
+      "cayenneExp": f"seasonId={season_id} and gameTypeId={int(game_type)}",
       "limit": -1,
    }
-   goalie_payload = _fetch_json(base_url, timeout_seconds, params=goalie_params)
+   goalie_payload = _fetch_json(goalie_url, timeout_seconds, params=goalie_params)
    goalie_rows = []
    if goalie_payload is not None:
       goalie_rows = _extract_record_list(goalie_payload)
+
+   if not skater_rows and not goalie_rows:
+      logging.warning(
+         "No player season rows returned for season %s (game_type=%s).",
+         season,
+         game_type,
+      )
+      return 0
 
    # Merge and deduplicate by player_id
    all_records: dict[int, dict] = {}

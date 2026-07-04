@@ -114,7 +114,7 @@ python Main.py --api-source both --capture-edge
 
 ## Player seasonal stats
 
-Starting with the 2025-26 season, `Main.py` automatically captures per-player seasonal statistics from the NHL Stats REST API (`/stats/rest/en/player-season-stats`) during every scrape run. This includes skater and goalie stats such as:
+Starting with the 2025-26 season, `Main.py` automatically captures per-player seasonal statistics from the NHL Stats REST API (`/stats/rest/en/skater/summary` and `/stats/rest/en/goalie/summary`) during every scrape run. This includes skater and goalie stats such as:
 
 - **Skater**: games played, TOI, goals, assists, points, shots on goal, plus/minus, PIM, power-play goals, short-handed goals, game-winning goals, blocked shots, hits, faceoffs, takeaways, giveaways
 - **Goalie**: save percentage, goals-against average, shutouts
@@ -149,7 +149,7 @@ This will automatically:
 - Fetch and store player seasonal stats with rate limiting
 - Skip seasons that already have stats (idempotent)
 
-The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2009 onward — though the Stats REST `player-season-stats` endpoint reaches back to 1918).
+The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2009 onward — though the Stats REST skater/goalie summary endpoints reach back much earlier).
 
 Run an EDGE-only pass (no shot scraping):
 
@@ -467,6 +467,7 @@ Current test coverage includes:
 A natural next step is modeling how player skill evolves with age. Instead of treating each player as a static effect, we could:
 
 - **General age curve** — fit a league-wide aging curve (e.g., peak at ~25-27, decline after 30) for shooters and goalies separately
+- **Feature-screened nonlinear age model** — start with a broad feature set available in this project (age, xG/game progression, GAX trend, TOI/game, shot quality mix, role/position, and selected Edge pace metrics), train a simple nonlinear model (e.g., gradient boosting), remove weak features using permutation importance/SHAP, then retrain and compare holdout performance to keep only meaningful predictors
 - **Archetype-specific curves** — cluster players by style (sniper, playmaker, power forward, butterfly goalie, hybrid) and fit separate curves
 - **Per-player estimation** — with enough seasons, estimate individual aging trajectories (hierarchical Bayesian or mixed-effects model)
 - **Application to non-NHL evaluation** — project junior/college/European players forward using age curves to identify undervalued prospects
