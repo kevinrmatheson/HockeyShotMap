@@ -17,13 +17,14 @@ from urllib3.util.retry import Retry
 
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 STATS_REST_BASE_URL = "https://api.nhle.com/stats/rest"
-# First season observed to include reliable x/y shot coordinates.
-COORDINATE_DATA_START_SEASON = 2005
+# First season with reliable x/y shot coordinates in the Web API.
+# 2007-2008 seasons have sparse/manual data; 2009 onward has full coverage.
+COORDINATE_DATA_START_SEASON = 2009
 
 # Performance tuning defaults for long historical runs.
 DB_COMMIT_INTERVAL_GAMES = 50
-SEASON_END_PROBE_START_GAME = 50
-SEASON_END_EMPTY_STREAK_GAMES = 50
+SEASON_END_PROBE_START_GAME = 100
+SEASON_END_EMPTY_STREAK_GAMES = 200
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_REQUEST_DELAY_SECONDS = 0.05
 HEARTBEAT_LOG_INTERVAL_SECONDS = 20
@@ -144,6 +145,7 @@ class ScrapeConfig:
    db_path: str = "hockey_shots.db"
    export_csv: str | None = None
    capture_player_season_stats: bool = False
+   empty_game_streak: int = SEASON_END_EMPTY_STREAK_GAMES
 
 
 def build_stats_shiftcharts_url() -> str:
@@ -1451,6 +1453,89 @@ def _load_team_codes_for_season(db_path: str, season: str) -> set[str]:
       return {row[0] for row in cursor.fetchall() if row and row[0]}
 
 
+def _get_all_seasons_from_db(db_path: str) -> list[str]:
+   """Get all distinct seasons from the shots table, sorted."""
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+      cursor.execute(
+         """
+         SELECT DISTINCT season
+         FROM shots
+         ORDER BY season
+         """
+      )
+      return [row[0] for row in cursor.fetchall() if row and row[0]]
+
+
+def _get_all_game_types_from_db(db_path: str, season: str) -> list[str]:
+   """Get all distinct game types for a given season from the shots table."""
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+      cursor.execute(
+         """
+         SELECT DISTINCT game_type
+         FROM season_scrape_runs
+         WHERE season = ?
+         ORDER BY game_type
+         """,
+         (season,),
+      )
+      game_types = [row[0] for row in cursor.fetchall() if row and row[0]]
+      # If no scrape runs recorded, fall back to checking shots table
+      if not game_types:
+         cursor.execute(
+            """
+            SELECT DISTINCT game_type
+            FROM shots
+            WHERE season = ?
+            ORDER BY game_type
+            """,
+            (season,),
+         )
+         game_types = [row[0] for row in cursor.fetchall() if row and row[0]]
+      return game_types
+
+
+def run_player_stats_backfill(db_path: str, timeout_seconds: int, request_delay_seconds: float) -> int:
+   """
+   Run player seasonal stats backfill for all seasons and game types in the database.
+   Returns the total number of rows inserted.
+   """
+   initialize_database(db_path)
+   configure_request_rate_limit(request_delay_seconds)
+
+   seasons = _get_all_seasons_from_db(db_path)
+   if not seasons:
+      logging.info("No seasons found in database for player stats backfill.")
+      return 0
+
+   total_inserted = 0
+   for season in seasons:
+      game_types = _get_all_game_types_from_db(db_path, season)
+      if not game_types:
+         logging.info("No game types found for season %s, skipping.", season)
+         continue
+
+      for game_type in game_types:
+         logging.info("Backfilling player stats for season %s, game_type %s", season, game_type)
+         inserted = fetch_and_store_player_season_stats(
+            db_path,
+            season,
+            game_type,
+            timeout_seconds,
+         )
+         total_inserted += inserted
+         logging.info(
+            "Season %s game_type %s: inserted %s player season stats rows",
+            season,
+            game_type,
+            inserted,
+         )
+
+   logging.info("Player stats backfill complete. Total rows inserted: %s", total_inserted)
+   return total_inserted
+
+
 def _parse_player_season_stats_row(record: dict, season: str, game_type: str) -> dict | None:
    """Parse a single player-season-stats record into a normalized row."""
    player_id = record.get("playerId")
@@ -1637,6 +1722,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
    edge_payloads_inserted = 0
    edge_detail_payloads_inserted = 0
    team_codes_seen: set[str] = set()
+   empty_game_streak_threshold = max(10, int(config.empty_game_streak)) if hasattr(config, 'empty_game_streak') and config.empty_game_streak else SEASON_END_EMPTY_STREAK_GAMES
    if _season_run_is_complete(config.db_path, config.season, config.game_type, config.start_game, config.end_game):
       logging.info(
          "Season %s game_type %s range %s-%s already completed in the database; skipping scrape.",
@@ -1729,7 +1815,7 @@ def run_season_scrape(config: ScrapeConfig, active_sources: list[str], capture_e
                      rows_inserted,
                   )
 
-               if game_id >= SEASON_END_PROBE_START_GAME and empty_game_streak >= SEASON_END_EMPTY_STREAK_GAMES:
+               if game_id >= SEASON_END_PROBE_START_GAME and empty_game_streak >= config.empty_game_streak:
                   logging.info(
                      "Season %s: stopping early at game %s after %s consecutive empty games.",
                      config.season,
@@ -1912,7 +1998,7 @@ def parse_args() -> argparse.Namespace:
       "--start-season",
       type=int,
       default=None,
-      help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first coordinate-data season) when --season is not used.",
+      help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first reliable coordinate-data season) when --season is not used.",
    )
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season for multi-season run. Defaults to current NHL season.")
    parser.add_argument("--api-source", default="both", choices=["web", "stats", "both"], help="Choose Web API, Stats REST API, or both.")
@@ -1922,12 +2008,14 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--game-type", default=REGULAR_SEASON, choices=[PRESEASON, REGULAR_SEASON, PLAYOFFS, ALLSTAR])
    parser.add_argument("--start-game", type=int, default=1)
    parser.add_argument("--end-game", type=int, default=1271)
+   parser.add_argument("--empty-game-streak", type=int, default=SEASON_END_EMPTY_STREAK_GAMES, help="Consecutive empty games before auto-stopping a season (default: %(default)s). Increase for older/sparse seasons.")
    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout in seconds.")
    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Maximum number of concurrent game fetch workers.")
    parser.add_argument("--request-delay", type=float, default=DEFAULT_REQUEST_DELAY_SECONDS, help="Minimum delay in seconds between API requests.")
    parser.add_argument("--db-path", default="hockey_data.db", help="SQLite database path.")
    parser.add_argument("--export-csv", default=None, help="Optional Tableau-compatible CSV export path.")
    parser.add_argument("--no-player-stats", action="store_true", help="Disable automatic capture of per-player seasonal stats from Stats REST API.")
+   parser.add_argument("--player-stats-backfill", action="store_true", help="Run player seasonal stats backfill for all seasons in database (all game types).")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -1936,6 +2024,17 @@ def main() -> None:
    # Entrypoint: read args, run scrape, optionally export CSV.
    args = parse_args()
    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+
+   # Handle player stats backfill mode
+   if args.player_stats_backfill:
+      logging.info("Running player seasonal stats backfill for all seasons in database...")
+      total_inserted = run_player_stats_backfill(
+         args.db_path,
+         args.timeout,
+         args.request_delay,
+      )
+      logging.info("Player stats backfill complete. Total rows inserted: %s", total_inserted)
+      return
 
    # Detect source reachability once up front to avoid noisy per-game failures.
    active_sources = detect_available_sources(args.api_source, args.timeout)
@@ -1974,6 +2073,7 @@ def main() -> None:
          db_path=args.db_path,
          export_csv=None,
          capture_player_season_stats=capture_player_season_stats,
+         empty_game_streak=args.empty_game_streak,
       )
       if args.edge_only:
          edge_payloads, edge_detail_payloads = run_edge_capture_only(

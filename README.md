@@ -83,7 +83,13 @@ Default run (regular season, full game range, SQLite output):
 python Main.py
 ```
 
-By default this runs from 2005 (first season with coordinate shot data) through the current NHL season.
+By default this runs from 2009 (first season with reliable coordinate shot data) through the current NHL season.
+
+**Note on pre-2009 data**: The NHL Web API only has sparse/manual shot coordinates before the 2009-10 season. A few games in 2008 may have coordinates but most do not. To attempt scraping older seasons:
+
+```bash
+python Main.py --start-season 2008 --end-season 2008 --empty-game-streak 500
+```
 
 When a specific game, team, or player endpoint does not exist for a season (for example expansion-era teams in earlier years), 404 responses are treated as optional and skipped so the scrape can continue.
 
@@ -131,7 +137,19 @@ Main.fetch_and_store_player_season_stats('hockey_data.db', '2024', '02', 10)
 "
 ```
 
-The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2005 onward).
+To backfill player stats for **all seasons** in your database (all game types):
+
+```bash
+python Main.py --player-stats-backfill --db-path hockey_data.db
+```
+
+This will automatically:
+- Detect all seasons from your existing shot data
+- Detect all game types for each season
+- Fetch and store player seasonal stats with rate limiting
+- Skip seasons that already have stats (idempotent)
+
+The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2009 onward — though the Stats REST `player-season-stats` endpoint reaches back to 1918).
 
 Run an EDGE-only pass (no shot scraping):
 
@@ -196,6 +214,12 @@ After scraping data into SQLite, run:
 
 ```bash
 python Metrics.py --db-path hockey_data.db --season 2024
+```
+
+To force a re-run that replaces all output tables for a season (ignoring the staleness check):
+
+```bash
+python Metrics.py --db-path hockey_data.db --season 2024 --force
 ```
 
 Refresh behavior is season-aware and incremental:
@@ -327,6 +351,7 @@ Useful CLI arguments:
 - `--capture-edge-deep`
 - `--start-game`
 - `--end-game`
+- `--empty-game-streak` (default `200`, increase for older/sparse seasons)
 - `--timeout`
 - `--db-path`
 - `--export-csv`

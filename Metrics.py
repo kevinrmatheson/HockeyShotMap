@@ -44,9 +44,55 @@ class MetricsConfig:
    compute_rate_metrics: bool = True  # Compute per-60 rate metrics
    rolling_window_seasons: int = 3  # Number of seasons for rolling benchmarks
    include_age_adjusted: bool = True  # Age-adjusted career trajectory comparisons
+   force_refresh: bool = False  # Ignore staleness check; re-score and replace all target seasons
 
 
 FEATURE_SPEC_VERSION = "v3_xgb_player"
+
+
+def _backfill_player_names(connection: sqlite3.Connection) -> dict[str, int]:
+   """Fill in missing shooter and goalie names in the shots table from the players table.
+
+   The shots table often has shooter_id/goalie_id populated but the corresponding
+   name columns (shooter, goalie) are NULL. This backfill resolves names from the
+   players table (populated by player_bio.py) so downstream metrics tables get
+   proper player names.
+
+   If the players table does not exist (e.g. player_bio.py has not been run yet),
+   this is a no-op.
+   """
+   cursor = connection.cursor()
+
+   # Check if the players table exists first
+   cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='players'")
+   if cursor.fetchone() is None:
+      return {"shooter_filled": 0, "goalie_filled": 0}
+
+   # Backfill shooter names
+   cursor.execute("""
+      UPDATE shots
+      SET shooter = (
+         SELECT full_name FROM players WHERE players.player_id = shots.shooter_id
+      )
+      WHERE (shooter IS NULL OR shooter = '')
+        AND shooter_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM players WHERE players.player_id = shots.shooter_id)
+   """)
+   shooter_filled = cursor.rowcount
+
+   # Backfill goalie names
+   cursor.execute("""
+      UPDATE shots
+      SET goalie = (
+         SELECT full_name FROM players WHERE players.player_id = shots.goalie_id
+      )
+      WHERE (goalie IS NULL OR goalie = '')
+        AND goalie_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM players WHERE players.player_id = shots.goalie_id)
+   """)
+   goalie_filled = cursor.rowcount
+
+   return {"shooter_filled": shooter_filled, "goalie_filled": goalie_filled}
 
 
 def _season_range(start_season: int, end_season: int | None) -> list[str]:
@@ -54,6 +100,48 @@ def _season_range(start_season: int, end_season: int | None) -> list[str]:
    if resolved_end < start_season:
       raise ValueError("end season must be greater than or equal to start season")
    return [str(year) for year in range(start_season, resolved_end + 1)]
+
+
+def _table_exists(executor: sqlite3.Connection | sqlite3.Cursor, table_name: str) -> bool:
+   return (
+      executor.execute(
+         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+         (table_name,),
+      ).fetchone()
+      is not None
+   )
+
+
+def _load_player_seasonal_stats(
+   connection: sqlite3.Connection,
+   seasons: list[str],
+) -> dict[tuple[int, str], dict[str, object]]:
+   if not seasons or not _table_exists(connection, "player_seasonal_stats"):
+      return {}
+
+   placeholders = ",".join("?" for _ in seasons)
+   rows = connection.execute(
+      f"""
+      SELECT player_id,
+             season,
+             MAX(player_name) AS player_name,
+             SUM(games_played) AS games_played,
+             SUM(toi_seconds) AS toi_seconds
+      FROM player_seasonal_stats
+      WHERE season IN ({placeholders})
+      GROUP BY player_id, season
+      """,
+      seasons,
+   ).fetchall()
+
+   stats: dict[tuple[int, str], dict[str, object]] = {}
+   for row in rows:
+      stats[(int(row[0]), str(row[1]))] = {
+         "player_name": str(row[2] or "Unknown"),
+         "games_played": int(row[3] or 0),
+         "toi_seconds": int(row[4] or 0),
+      }
+   return stats
 
 
 def _temporal_split_indices(
@@ -330,6 +418,7 @@ def initialize_metrics_tables(db_path: str) -> None:
             rolling_3yr_xg_per_60 REAL,
             age INTEGER,
             age_adjusted_gax_per_60 REAL,
+            age_adjusted_gax REAL,
             PRIMARY KEY (season, model_version, shooter, shooter_id, team)
          )
          """
@@ -353,6 +442,14 @@ def initialize_metrics_tables(db_path: str) -> None:
          )
          """
       )
+
+      # Backward-compatible migration: ensure player_season_advanced_metrics has age column
+      cursor.execute("PRAGMA table_info(player_season_advanced_metrics)")
+      adv_columns = {row[1] for row in cursor.fetchall()}
+      if "age" not in adv_columns:
+         cursor.execute("ALTER TABLE player_season_advanced_metrics ADD COLUMN age INTEGER")
+      if "age_adjusted_gax" not in adv_columns:
+         cursor.execute("ALTER TABLE player_season_advanced_metrics ADD COLUMN age_adjusted_gax REAL")
 
       connection.commit()
 
@@ -989,25 +1086,57 @@ def _delete_existing_model_outputs(cursor: sqlite3.Cursor, seasons: list[str]) -
    cursor.execute(f"DELETE FROM player_season_metrics WHERE season IN ({placeholders})", seasons)
    cursor.execute(f"DELETE FROM team_season_metrics WHERE season IN ({placeholders})", seasons)
    cursor.execute(f"DELETE FROM goalie_season_metrics WHERE season IN ({placeholders})", seasons)
+   cursor.execute(f"DELETE FROM player_season_advanced_metrics WHERE season IN ({placeholders})", seasons)
+   cursor.execute(f"DELETE FROM team_strength_metrics WHERE season IN ({placeholders})", seasons)
+   cursor.execute(f"DELETE FROM player_career_trajectory WHERE season IN ({placeholders})", seasons)
+   cursor.execute(f"DELETE FROM goalie_career_trajectory WHERE season IN ({placeholders})", seasons)
 
 
 def _persist_player_season_metrics(cursor: sqlite3.Cursor, model_version: str, seasons: list[str], min_shots: int) -> int:
    placeholders = ",".join("?" for _ in seasons)
-   query = f"""
-      SELECT s.season,
-             COALESCE(s.shooter, 'Unknown') AS shooter,
-             s.shooter_id,
-             s.team,
-             COUNT(*) AS shots,
-             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
-             SUM(x.xg) AS xg
-      FROM shots s
-      JOIN shot_xg x ON x.event_hash = s.event_hash
-      WHERE x.model_version = ?
-        AND s.season IN ({placeholders})
-      GROUP BY s.season, shooter, s.shooter_id, s.team
-   """
-   rows = [dict(row) for row in cursor.execute(query, [model_version, *seasons]).fetchall()]
+   if _table_exists(cursor, "player_seasonal_stats"):
+      query = f"""
+         WITH player_stats AS (
+            SELECT player_id,
+                   season,
+                   MAX(player_name) AS player_name,
+                   SUM(games_played) AS games_played,
+                   SUM(toi_seconds) AS toi_seconds
+            FROM player_seasonal_stats
+            WHERE season IN ({placeholders})
+            GROUP BY player_id, season
+         )
+         SELECT s.season,
+                COALESCE(ps.player_name, s.shooter, 'Unknown') AS shooter,
+                s.shooter_id,
+                s.team,
+                COUNT(*) AS shots,
+                SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
+                SUM(x.xg) AS xg
+         FROM shots s
+         JOIN shot_xg x ON x.event_hash = s.event_hash
+         LEFT JOIN player_stats ps ON ps.player_id = s.shooter_id AND ps.season = s.season
+         WHERE x.model_version = ?
+           AND s.season IN ({placeholders})
+         GROUP BY s.season, s.shooter_id, s.team
+      """
+      rows = [dict(row) for row in cursor.execute(query, [*seasons, model_version, *seasons]).fetchall()]
+   else:
+      query = f"""
+         SELECT s.season,
+                COALESCE(s.shooter, 'Unknown') AS shooter,
+                s.shooter_id,
+                s.team,
+                COUNT(*) AS shots,
+                SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
+                SUM(x.xg) AS xg
+         FROM shots s
+         JOIN shot_xg x ON x.event_hash = s.event_hash
+         WHERE x.model_version = ?
+           AND s.season IN ({placeholders})
+         GROUP BY s.season, s.shooter_id, s.team
+      """
+      rows = [dict(row) for row in cursor.execute(query, [model_version, *seasons]).fetchall()]
    if not rows:
       return 0
 
@@ -1131,23 +1260,51 @@ def _persist_team_season_metrics(cursor: sqlite3.Cursor, model_version: str, sea
 
 def _persist_goalie_season_metrics(cursor: sqlite3.Cursor, model_version: str, seasons: list[str]) -> int:
    placeholders = ",".join("?" for _ in seasons)
-   rows = cursor.execute(
-      f"""
-      SELECT s.season,
-             COALESCE(s.goalie, 'Unknown') AS goalie,
-             s.goalie_id,
-             COUNT(*) AS shots_against,
-             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals_against,
-             SUM(x.xg) AS xga
-      FROM shots s
-      JOIN shot_xg x ON x.event_hash = s.event_hash
-      WHERE x.model_version = ?
-        AND s.season IN ({placeholders})
-        AND s.goalie IS NOT NULL
-      GROUP BY s.season, goalie, s.goalie_id
-      """,
-      [model_version, *seasons],
-   ).fetchall()
+   if _table_exists(cursor, "player_seasonal_stats"):
+      rows = cursor.execute(
+         f"""
+         WITH player_stats AS (
+            SELECT player_id,
+                   season,
+                   MAX(player_name) AS player_name
+            FROM player_seasonal_stats
+            WHERE season IN ({placeholders})
+            GROUP BY player_id, season
+         )
+         SELECT s.season,
+                COALESCE(ps.player_name, s.goalie, 'Unknown') AS goalie,
+                s.goalie_id,
+                COUNT(*) AS shots_against,
+                SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals_against,
+                SUM(x.xg) AS xga
+         FROM shots s
+         JOIN shot_xg x ON x.event_hash = s.event_hash
+         LEFT JOIN player_stats ps ON ps.player_id = s.goalie_id AND ps.season = s.season
+         WHERE x.model_version = ?
+           AND s.season IN ({placeholders})
+           AND s.goalie_id IS NOT NULL
+         GROUP BY s.season, s.goalie_id
+         """,
+         [*seasons, model_version, *seasons],
+      ).fetchall()
+   else:
+      rows = cursor.execute(
+         f"""
+         SELECT s.season,
+                COALESCE(s.goalie, 'Unknown') AS goalie,
+                s.goalie_id,
+                COUNT(*) AS shots_against,
+                SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals_against,
+                SUM(x.xg) AS xga
+         FROM shots s
+         JOIN shot_xg x ON x.event_hash = s.event_hash
+         WHERE x.model_version = ?
+           AND s.season IN ({placeholders})
+           AND s.goalie_id IS NOT NULL
+         GROUP BY s.season, s.goalie_id
+         """,
+         [model_version, *seasons],
+      ).fetchall()
 
    insert_rows = []
    for row in rows:
@@ -1195,23 +1352,8 @@ def _compute_player_career_trajectory(
    lookback: int,
 ) -> int:
    """Compute career and trailing multi-year stats for each shooter."""
-   placeholders = ",".join("?" for _ in list(seasons) + [model_version])
-   query = f"""
-      SELECT s.shooter,
-             COALESCE(s.shooter_id, -1) AS shooter_id,
-             s.season,
-             COUNT(*) AS shots,
-             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
-             SUM(x.xg) AS xg
-      FROM shots s
-      JOIN shot_xg x ON x.event_hash = s.event_hash
-      WHERE x.model_version = ?
-        AND s.season IN ({placeholders})
-        AND s.shooter_id IS NOT NULL
-      GROUP BY s.shooter_id, s.season
-   """
    rows = cursor.execute(f"""
-      SELECT s.shooter,
+      SELECT COALESCE(s.shooter, 'Unknown') AS shooter,
              COALESCE(s.shooter_id, -1) AS shooter_id,
              s.season,
              COUNT(*) AS shots,
@@ -1442,6 +1584,7 @@ def _compute_team_strength_metrics(
    placeholders = ",".join("?" for _ in seasons)
    rows = cursor.execute(f"""
       SELECT s.team,
+             s.season,
              COUNT(*) AS shots,
              SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS goals,
              SUM(x.xg) AS xg,
@@ -1456,13 +1599,16 @@ def _compute_team_strength_metrics(
    """, [model_version, *seasons]).fetchall()
 
    # Get goalie save percentages by team for the season
+   # Join shots with goalie info to get team-level goalie stats
    goalie_rows = cursor.execute(f"""
-      SELECT team,
-             SUM(shots_against) AS total_shots_against,
-             SUM(goals_against) AS total_goals_against
-      FROM goalie_season_metrics
-      WHERE season IN ({placeholders})
-      GROUP BY team
+      SELECT s.team,
+             COUNT(*) AS total_shots_against,
+             SUM(CASE WHEN s.shot_result = 'Goal' THEN 1 ELSE 0 END) AS total_goals_against
+      FROM shots s
+      WHERE s.season IN ({placeholders})
+        AND s.goalie_id IS NOT NULL
+        AND s.shot_result IN ('Goal', 'ngshot')
+      GROUP BY s.team
    """, seasons).fetchall()
 
    team_goalie_save_pct = {}
@@ -1474,16 +1620,17 @@ def _compute_team_strength_metrics(
    insert_rows = []
    for row in rows:
       team = str(row[0])
-      shots = int(row[1] or 0)
-      goals = int(row[2] or 0)
-      xg = float(row[3] or 0.0)
+      season = str(row[1])
+      shots = int(row[2] or 0)
+      goals = int(row[3] or 0)
+      xg = float(row[4] or 0.0)
       insert_rows.append((
-         str(row[5]) if len(row) > 5 else seasons[0],  # season
+         season,
          team,
          goals,
-         int(row[2] or 0) if len(row) > 2 else goals,  # goals_against - placeholder
+         goals,  # goals_against - using same as goals_for for now (would need opponent data)
          xg,
-         float(row[3] or 0.0) if len(row) > 3 else xg,  # xga - placeholder
+         xg,  # xga - placeholder
          team_goalie_save_pct.get(team, 0.0),
       ))
 
@@ -1509,50 +1656,147 @@ def _compute_player_season_advanced_metrics(
    rolling_window: int,
    include_age_adjusted: bool,
 ) -> int:
-   """Compute advanced rate-based metrics for players."""
-   # Get player season basic metrics
+   """Compute advanced rate-based metrics for players.
+
+   Fixes applied over the original placeholder implementation:
+
+   * **Games count** — Uses COUNT(DISTINCT game_id) from the shots table
+     per shooter per season instead of a shots/20 heuristic.
+   * **Age** — Resolved from the players table (birth_date) and computed
+     as age at the start of each season (October 1st).
+   * **Column indices** — Uses named column access (sqlite3.Row) so that
+     goals_above_expected is never confused with shooting_pct.
+   * **Rolling window** — Uses the corrected per-game rate for the trailing
+     N seasons, computed from the actual per-season aggregates.
+   * **age_adjusted_gax** — Raw-age-adjusted GAR column added alongside
+     the per-60 variant.
+   """
+   from datetime import date, datetime
+
+   saved_factory = connection.row_factory
+   connection.row_factory = sqlite3.Row
+
+   # ------------------------------------------------------------------
+   # 1. Basic per-player-per-season aggregates from player_season_metrics
+   # ------------------------------------------------------------------
    player_rows = cursor.execute(f"""
-      SELECT season, shooter, shooter_id, team, shots, goals, xg, gax, shooting_pct, xg_per_shot
+      SELECT season, shooter, shooter_id, team, shots, goals, xg,
+             goals_above_expected, shooting_pct, xg_per_shot
       FROM player_season_metrics
       WHERE model_version = ?
         AND season IN ({','.join('?' for _ in seasons)})
    """, [model_version, *seasons]).fetchall()
+   season_stats = _load_player_seasonal_stats(connection, seasons)
 
-   # Get team strength metrics for opponent adjustment
-   team_strength = {}
-   for row in cursor.execute("SELECT team, xg_for, goals_for FROM team_strength_metrics"):
-      team_strength[str(row[0])] = {
-         "xg_for": float(row[1] or 0.0),
-         "goals_for": float(row[2] or 0.0),
-      }
+   # ------------------------------------------------------------------
+   # 2. Real game counts per shooter per season (distinct game_id)
+   # ------------------------------------------------------------------
+   game_count_rows = cursor.execute(f"""
+      SELECT shooter_id, season, COUNT(DISTINCT game_id) AS games_played
+      FROM shots
+      WHERE season IN ({','.join('?' for _ in seasons)})
+        AND shot_result IN ('Goal', 'ngshot')
+        AND shooter_id IS NOT NULL
+        AND COALESCE(is_empty_net, 0) = 0
+      GROUP BY shooter_id, season
+   """, seasons).fetchall()
 
-   # Get games played and TOI (we'll estimate from shots for now)
-   # In a full implementation, you'd join with a games table
-   # Estimate ~20 shots per game for rate calculations
-   shots_per_game = 20.0
+   games_by_player: dict[int, dict[str, int]] = {}
+   for row in game_count_rows:
+      sid = int(row["shooter_id"])
+      games_by_player.setdefault(sid, {})[str(row["season"])] = int(row["games_played"])
 
-   # Build player data by season for rolling calculations
+   # ------------------------------------------------------------------
+   # 3. Player ages from players table (birth_date)
+   # ------------------------------------------------------------------
+   player_birth: dict[int, date] = {}
+   age_table_exists = cursor.execute(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='players'"
+   ).fetchone() is not None
+   if age_table_exists:
+      age_rows = cursor.execute("""
+         SELECT player_id, birth_date
+         FROM players
+         WHERE birth_date IS NOT NULL
+      """).fetchall()
+      for row in age_rows:
+         pid = int(row["player_id"])
+         bd = str(row["birth_date"]).strip()
+         try:
+            dt = datetime.strptime(bd, "%Y-%m-%d").date()
+         except (ValueError, TypeError):
+            continue
+         player_birth[pid] = dt
+
+   def _age_at_season_start(birth: date, season: str) -> int:
+      """Age on October 1st of the given season year."""
+      try:
+         season_start = date(int(season), 10, 1)
+      except (ValueError, TypeError):
+         return 0
+      return season_start.year - birth.year - (
+         (season_start.month, season_start.day) < (birth.month, birth.day)
+      )
+
+   # ------------------------------------------------------------------
+   # 4. Build player-season data dict (using named columns!)
+   # ------------------------------------------------------------------
    player_season_data: dict[int, dict[str, dict]] = {}
    for row in player_rows:
-      sid = int(row[2] or -1)
+      sid = int(row["shooter_id"] or -1)
       if sid == -1:
          continue
-      season = str(row[0])
+      season = str(row["season"])
+      goals = int(row["goals"] or 0)
+      xg = float(row["xg"] or 0.0)
+      gax = goals - xg
+      stats = season_stats.get((sid, season))
+      games = int(stats["games_played"]) if stats else games_by_player.get(sid, {}).get(season, 0)
+      shooting_pct = float(row["shooting_pct"] or 0.0)
+      xg_per_shot = float(row["xg_per_shot"] or 0.0)
+      # Age at season start from birth date (fall back to 0 if unknown)
+      birth = player_birth.get(sid)
+      age = _age_at_season_start(birth, season) if birth else 0
       player_season_data.setdefault(sid, {})[season] = {
-         "name": str(row[1]),
-         "team": str(row[3]),
-         "shots": int(row[4] or 0),
-         "goals": int(row[5] or 0),
-         "xg": float(row[6] or 0.0),
-         "gax": float(row[7] or 0.0),
-         "shooting_pct": float(row[8] or 0.0),
-         "xg_per_shot": float(row[9] or 0.0),
+         "name": str(stats["player_name"] if stats else row["shooter"]),
+         "team": str(row["team"]),
+         "shots": int(row["shots"] or 0),
+         "goals": goals,
+         "xg": xg,
+         "gax": gax,
+         "shooting_pct": shooting_pct,
+         "xg_per_shot": xg_per_shot,
+         "games": games,
+         "age": age,
+         "toi_minutes": (float(stats["toi_seconds"]) / 60.0) if stats else float(games * 60.0),
       }
 
-   # Get all seasons sorted
-   all_seasons = sorted({s for s_data in player_season_data.values() for s in s_data})
+   all_seasons = sorted({s for sd in player_season_data.values() for s in sd})
 
-   insert_rows = []
+   # ------------------------------------------------------------------
+   # 5. League averages per season (computed from every qualified player)
+   # ------------------------------------------------------------------
+   league_avg: dict[str, dict[str, float]] = {}
+   for season in seasons:
+      season_players = [
+         d for sd in player_season_data.values()
+         if season in sd for d in [sd[season]]
+      ]
+      qualified = [d for d in season_players if d["shots"] >= min_shots and d["games"] > 0]
+      if not qualified:
+         league_avg[season] = {"gax_per_game": 0.0, "xg_per_game": 0.0, "shooting_pct": 0.0}
+         continue
+      league_avg[season] = {
+         "gax_per_game": sum(d["gax"] for d in qualified) / sum(d["games"] for d in qualified),
+         "xg_per_game": sum(d["xg"] for d in qualified) / sum(d["games"] for d in qualified),
+         "shooting_pct": sum(d["goals"] for d in qualified) / sum(d["shots"] for d in qualified),
+      }
+
+   # ------------------------------------------------------------------
+   # 6. Build insert rows
+   # ------------------------------------------------------------------
+   insert_rows: list[tuple] = []
+
    for sid, season_map in player_season_data.items():
       name = next(iter(season_map.values()))["name"]
 
@@ -1567,42 +1811,63 @@ def _compute_player_season_advanced_metrics(
          gax = data["gax"]
          shooting_pct = data["shooting_pct"]
          xg_per_shot = data["xg_per_shot"]
+         games = data["games"]
+         age = data["age"]
 
-         # Rate metrics (per 60 minutes)
-         # Estimate games from shots (assuming ~20 shots per game)
-         games = shots / shots_per_game if shots_per_game > 0 else 0
-         toi = games * 60.0  # Estimated time on ice
+         # -- Per-game rates (more robust than per-60 when TOI is absent) --
+         toi = float(data["toi_minutes"])
 
          gax_per_60 = (gax / toi * 60.0) if toi > 0 else 0.0
          xg_per_60 = (xg / toi * 60.0) if toi > 0 else 0.0
-         shooting_pct_per_60 = shooting_pct  # Shooting % is rate-independent
+         shooting_pct_per_60 = shooting_pct  # already a proportion
 
-         # League averages for the season
-         league_avg_xg_per_60 = 2.5  # Typical NHL league average
-         league_avg_shooting_pct_per_60 = 0.082  # Typical NHL league average
+         # -- League benchmarks --
+         lavg = league_avg.get(season, {"gax_per_game": 0.0, "xg_per_game": 0.0, "shooting_pct": 0.0})
+         # Per-game league averages converted to per-60 for comparability
+         league_avg_gax_per_60 = lavg["gax_per_game"] * 60.0 / 60.0  # = gax/game; same scale
+         league_avg_xg_per_60 = lavg["xg_per_game"] * 60.0 / 60.0
+         league_avg_shooting_pct = lavg["shooting_pct"]
 
-         delta_gax_per_60 = gax_per_60 - league_avg_xg_per_60
-         delta_shooting_pct_per_60 = shooting_pct_per_60 - league_avg_shooting_pct_per_60
+         delta_gax_per_60 = gax_per_60 - league_avg_gax_per_60
+         delta_shooting_pct = shooting_pct - league_avg_shooting_pct
 
-         # Rolling window metrics
+         # -- Rolling window (N previous seasons including current) --
          season_idx = all_seasons.index(season)
-         rolling_seasons = all_seasons[max(0, season_idx - rolling_window + 1):season_idx + 1]
+         rolling_seasons_list = all_seasons[max(0, season_idx - rolling_window + 1):season_idx + 1]
 
          rolling_gax = 0.0
          rolling_xg = 0.0
-         rolling_shots = 0
-         for rs in rolling_seasons:
+         rolling_games = 0
+         for rs in rolling_seasons_list:
             if rs in season_map:
                rolling_gax += season_map[rs]["gax"]
                rolling_xg += season_map[rs]["xg"]
-               rolling_shots += season_map[rs]["shots"]
+               rolling_games += season_map[rs]["games"]
 
-         rolling_gax_per_60 = (rolling_gax / (rolling_shots / shots_per_game / 60.0)) if rolling_shots > 0 else 0.0
-         rolling_xg_per_60 = (rolling_xg / (rolling_shots / shots_per_game / 60.0)) if rolling_shots > 0 else 0.0
+         rolling_gax_per_60 = (rolling_gax / (rolling_games * 60.0) * 60.0) if rolling_games > 0 else 0.0
+         rolling_xg_per_60 = (rolling_xg / (rolling_games * 60.0) * 60.0) if rolling_games > 0 else 0.0
 
-         # Age-adjusted metrics (simplified - would need birth year from player table)
-         age = 25  # Placeholder - would need player birth year
-         age_adjusted_gax_per_60 = gax_per_60  # Would apply age curve adjustment
+         # -- Age-adjusted metrics --
+         # Simple age adjustment: shift gax_per_60 toward 0 for extreme ages
+         # based on an approximate NHL prime curve.  Peak ~24-28.
+         if include_age_adjusted and age > 0:
+            if age < 22:
+               age_factor = 0.85  # 85% of peak
+            elif age < 24:
+               age_factor = 0.93
+            elif age <= 28:
+               age_factor = 1.0  # prime
+            elif age <= 31:
+               age_factor = 0.90
+            elif age <= 34:
+               age_factor = 0.78
+            else:
+               age_factor = 0.65
+            age_adjusted_gax_per_60 = gax_per_60 * age_factor
+            age_adjusted_gax = gax * age_factor
+         else:
+            age_adjusted_gax_per_60 = gax_per_60
+            age_adjusted_gax = gax
 
          insert_rows.append((
             season,
@@ -1610,7 +1875,7 @@ def _compute_player_season_advanced_metrics(
             name,
             sid,
             data["team"],
-            int(games),
+            games,
             toi,
             shots,
             goals,
@@ -1622,15 +1887,19 @@ def _compute_player_season_advanced_metrics(
             xg_per_60,
             shooting_pct_per_60,
             league_avg_xg_per_60,
-            league_avg_shooting_pct_per_60,
+            league_avg_shooting_pct,
             delta_gax_per_60,
-            delta_shooting_pct_per_60,
+            delta_shooting_pct,
             rolling_gax_per_60,
             rolling_xg_per_60,
             age,
             age_adjusted_gax_per_60,
+            age_adjusted_gax,
          ))
 
+   # ------------------------------------------------------------------
+   # 7. Persist
+   # ------------------------------------------------------------------
    if insert_rows:
       cursor.executemany(
          """
@@ -1641,12 +1910,13 @@ def _compute_player_season_advanced_metrics(
             league_avg_xg_per_60, league_avg_shooting_pct_per_60,
             delta_gax_per_60, delta_shooting_pct_per_60,
             rolling_3yr_gax_per_60, rolling_3yr_xg_per_60,
-            age, age_adjusted_gax_per_60
+            age, age_adjusted_gax_per_60, age_adjusted_gax
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          """,
          insert_rows,
       )
 
+   connection.row_factory = saved_factory
    return len(insert_rows)
 
 
@@ -1657,53 +1927,115 @@ def _compute_player_career_advanced(
    seasons: list[str],
 ) -> int:
    """Compute career-level advanced metrics with trajectory analysis."""
-   # Get all player season data
+   from datetime import date, datetime
+
+   saved_factory = connection.row_factory
+   connection.row_factory = sqlite3.Row
+
+   # Get all player season data (using named columns to avoid index bugs)
    player_rows = cursor.execute(f"""
-      SELECT shooter, shooter_id, season, shots, goals, xg, gax, shooting_pct, xg_per_shot
+      SELECT shooter, shooter_id, season, shots, goals, xg, goals_above_expected, shooting_pct, xg_per_shot
       FROM player_season_metrics
       WHERE model_version = ?
         AND season IN ({','.join('?' for _ in seasons)})
    """, [model_version, *seasons]).fetchall()
+   season_stats = _load_player_seasonal_stats(connection, seasons)
 
-   # Build player data
+   # Get game counts per shooter per season
+   game_count_rows = cursor.execute(f"""
+      SELECT shooter_id, season, COUNT(DISTINCT game_id) AS games_played
+      FROM shots
+      WHERE season IN ({','.join('?' for _ in seasons)})
+        AND shot_result IN ('Goal', 'ngshot')
+        AND shooter_id IS NOT NULL
+        AND COALESCE(is_empty_net, 0) = 0
+      GROUP BY shooter_id, season
+   """, seasons).fetchall()
+
+   games_by_player: dict[int, dict[str, int]] = {}
+   for row in game_count_rows:
+      sid = int(row["shooter_id"])
+      games_by_player.setdefault(sid, {})[str(row["season"])] = int(row["games_played"])
+
+   # Get player ages
+   player_birth: dict[int, date] = {}
+   age_table_exists = cursor.execute(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='players'"
+   ).fetchone() is not None
+   if age_table_exists:
+      age_rows = cursor.execute("""
+         SELECT player_id, birth_date
+         FROM players
+         WHERE birth_date IS NOT NULL
+      """).fetchall()
+      for row in age_rows:
+         pid = int(row["player_id"])
+         bd = str(row["birth_date"]).strip()
+         try:
+            dt = datetime.strptime(bd, "%Y-%m-%d").date()
+         except (ValueError, TypeError):
+            continue
+         player_birth[pid] = dt
+
+   def _age_at_season_start(birth: date, season: str) -> int:
+      try:
+         season_start = date(int(season), 10, 1)
+      except (ValueError, TypeError):
+         return 0
+      return season_start.year - birth.year - (
+         (season_start.month, season_start.day) < (birth.month, birth.day)
+      )
+
+   # Build player data using named columns
    player_data: dict[int, dict[str, dict]] = {}
    for row in player_rows:
-      sid = int(row[1] or -1)
+      sid = int(row["shooter_id"] or -1)
       if sid == -1:
          continue
-      season = str(row[2])
+      season = str(row["season"])
+      goals = int(row["goals"] or 0)
+      xg = float(row["xg"] or 0.0)
+      gax = goals - xg
+      games = games_by_player.get(sid, {}).get(season, 0)
+      stats = season_stats.get((sid, season))
+      games = int(stats["games_played"]) if stats else games
+      birth = player_birth.get(sid)
+      age = _age_at_season_start(birth, season) if birth else 0
       player_data.setdefault(sid, {})[season] = {
-         "name": str(row[0]),
-         "shots": int(row[3] or 0),
-         "goals": int(row[4] or 0),
-         "xg": float(row[5] or 0.0),
-         "gax": float(row[6] or 0.0),
-         "shooting_pct": float(row[7] or 0.0),
-         "xg_per_shot": float(row[8] or 0.0),
+         "name": str(stats["player_name"] if stats else row["shooter"]),
+         "shots": int(row["shots"] or 0),
+         "goals": goals,
+         "xg": xg,
+         "gax": gax,
+         "shooting_pct": float(row["shooting_pct"] or 0.0),
+         "xg_per_shot": float(row["xg_per_shot"] or 0.0),
+         "games": games,
+         "age": age,
+         "toi_minutes": (float(stats["toi_seconds"]) / 60.0) if stats else float(games * 60.0),
       }
 
-   # Get all seasons sorted
-   all_seasons = sorted({s for s_data in player_data.values() for s in s_data})
+   all_seasons = sorted({s for sd in player_data.values() for s in sd})
 
    insert_rows = []
    for sid, season_map in player_data.items():
       name = next(iter(season_map.values()))["name"]
 
-      # Calculate career age (simplified - would need birth year)
-      career_age = 28  # Placeholder
+      # Career age: use the most recent season's age
+      latest_season = max(season_map.keys())
+      career_age = season_map[latest_season]["age"]
 
       # Calculate career totals
       career_shots = sum(s["shots"] for s in season_map.values())
       career_gax = sum(s["gax"] for s in season_map.values())
       career_xg = sum(s["xg"] for s in season_map.values())
       career_goals = sum(s["goals"] for s in season_map.values())
+      career_games = sum(s["games"] for s in season_map.values())
 
-      # Rate metrics
-      games = career_shots / 20.0 if career_shots > 0 else 0
-      toi = games * 60.0
+      # Rate metrics using actual game counts
+      toi = sum(float(s["toi_minutes"]) for s in season_map.values())
       career_gax_per_60 = (career_gax / toi * 60.0) if toi > 0 else 0.0
       career_xg_per_60 = (career_xg / toi * 60.0) if toi > 0 else 0.0
-      career_shooting_pct_per_60 = career_goals / career_shots if career_shots > 0 else 0.0
+      career_shooting_pct = career_goals / career_shots if career_shots > 0 else 0.0
 
       # Find peak season
       peak_season = None
@@ -1720,7 +2052,6 @@ def _compute_player_career_advanced(
          x = np.arange(len(seasons_list))
          if len(x) > 1 and np.std(gax_values) > 0:
             slope = np.polyfit(x, gax_values, 1)[0]
-            # R-squared
             y_pred = np.polyval([slope, np.mean(gax_values)], x)
             ss_res = np.sum((np.array(gax_values) - y_pred) ** 2)
             ss_tot = np.sum((np.array(gax_values) - np.mean(gax_values)) ** 2)
@@ -1739,7 +2070,7 @@ def _compute_player_career_advanced(
          career_age,
          career_gax_per_60,
          career_xg_per_60,
-         career_shooting_pct_per_60,
+         career_shooting_pct,
          peak_season,
          peak_gax,
          slope,
@@ -1759,6 +2090,7 @@ def _compute_player_career_advanced(
          insert_rows,
       )
 
+   connection.row_factory = saved_factory
    return len(insert_rows)
 
 
@@ -1775,6 +2107,17 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
 
    with sqlite3.connect(config.db_path) as connection:
       connection.row_factory = sqlite3.Row
+
+      # Backfill missing shooter/goalie names from the players table before
+      # computing any metrics, so downstream tables get proper player names.
+      backfill_result = _backfill_player_names(connection)
+      if backfill_result["shooter_filled"] > 0 or backfill_result["goalie_filled"] > 0:
+         logging.info(
+            "Backfilled player names: %d shooters, %d goalies",
+            backfill_result["shooter_filled"],
+            backfill_result["goalie_filled"],
+         )
+      connection.commit()
       score_fingerprint = _collect_source_fingerprint(connection, score_seasons)
       train_fingerprint = _collect_source_fingerprint(connection, train_seasons)
 
@@ -1939,6 +2282,9 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       dirty_seasons: list[str] = []
       skipped_seasons: list[str] = []
       for season in score_seasons:
+         if config.force_refresh:
+            dirty_seasons.append(season)
+            continue
          state = _season_state_row(connection, season)
          fingerprint = score_fingerprint[season]
          if state is None:
@@ -2120,6 +2466,7 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--no-opponent-strength", action="store_true", help="Disable opponent strength features.")
    parser.add_argument("--no-rate-metrics", action="store_true", help="Disable rate-based metrics (per-60).")
    parser.add_argument("--no-age-adjusted", action="store_true", help="Disable age-adjusted career trajectory metrics.")
+   parser.add_argument("--force", action="store_true", help="Skip staleness check; force re-score and replace all output tables for the target seasons.")
    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
    return parser.parse_args()
 
@@ -2153,6 +2500,7 @@ def main() -> None:
       compute_rate_metrics=not args.no_rate_metrics,
       rolling_window_seasons=args.rolling_window,
       include_age_adjusted=not args.no_age_adjusted,
+      force_refresh=args.force,
    )
 
    summary = run_metrics_refresh(config)

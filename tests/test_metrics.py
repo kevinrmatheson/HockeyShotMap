@@ -9,6 +9,121 @@ import Metrics
 
 
 class TestMetricsPipeline(unittest.TestCase):
+   def test_metrics_refresh_uses_player_season_stats_for_names_and_games(self):
+      db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_stats_{uuid.uuid4().hex}.db")
+      Main.initialize_database(db_path)
+
+      rows = []
+      for game_id in range(1, 11):
+         shooter_id = 101 if game_id <= 5 else 202
+         shooter_name = "Real Player A" if shooter_id == 101 else "Real Player B"
+         goalie_id = 301
+         goalie_name = "Real Goalie"
+         for shot_index in range(1, 26):
+            rows.append(
+               {
+                  "Shot": "Goal" if shot_index == 10 else "ngshot",
+                  "X": 60.0 + shot_index,
+                  "Y": -20.0 + shot_index,
+                  "Shot_Type": "Wrist",
+                  "Shooter": shooter_name,
+                  "Shooter_ID": shooter_id,
+                  "Team": "TOR",
+                  "Home_Away": 1,
+                  "Period": 1,
+                  "Period_Time": "10:00",
+                  "Period_Time_Remaining": "10:00",
+                  "Year": "2024",
+                  "GameID": game_id,
+                  "API_Source": "web",
+                  "Goalie": goalie_name,
+                  "Goalie_ID": goalie_id,
+                  "Shot_Distance": 25.0,
+                  "Shot_Angle": 15.0,
+                  "Is_Empty_Net": 0,
+                  "Strength_State": "5v5",
+                  "Score_Differential": 0,
+                  "Zone": "OZ",
+                  "Event_ID": (game_id * 1000) + shot_index,
+               }
+            )
+
+      Main.persist_rows(db_path, rows)
+
+      with sqlite3.connect(db_path) as connection:
+         connection.execute(
+            """
+            INSERT OR REPLACE INTO player_seasonal_stats (
+               player_id, player_name, season, game_type, team, position,
+               games_played, toi_seconds, goals, assists, points, shots_on_goal,
+               plus_minus, penalty_minutes, power_play_goals, short_handed_goals,
+               game_winning_goals, blocked_shots, hits, faceoffs_won, faceoffs_lost,
+               takeaways, giveaways, save_pct, goals_against_avg, shutouts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+               101, "Real Player A", "2024", "02", "TOR", "C", 10, 12345, 0, 0, 0, 10,
+               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0,
+            ),
+         )
+         connection.execute(
+            """
+            INSERT OR REPLACE INTO player_seasonal_stats (
+               player_id, player_name, season, game_type, team, position,
+               games_played, toi_seconds, goals, assists, points, shots_on_goal,
+               plus_minus, penalty_minutes, power_play_goals, short_handed_goals,
+               game_winning_goals, blocked_shots, hits, faceoffs_won, faceoffs_lost,
+               takeaways, giveaways, save_pct, goals_against_avg, shutouts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+               202, "Real Player B", "2024", "02", "TOR", "W", 10, 12345, 0, 0, 0, 10,
+               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0,
+            ),
+         )
+         connection.execute(
+            """
+            INSERT OR REPLACE INTO player_seasonal_stats (
+               player_id, player_name, season, game_type, team, position,
+               games_played, toi_seconds, goals, assists, points, shots_on_goal,
+               plus_minus, penalty_minutes, power_play_goals, short_handed_goals,
+               game_winning_goals, blocked_shots, hits, faceoffs_won, faceoffs_lost,
+               takeaways, giveaways, save_pct, goals_against_avg, shutouts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+               301, "Real Goalie", "2024", "02", "TOR", "G", 10, 18000, 0, 0, 0, 0,
+               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.915, 2.15, 1,
+            ),
+         )
+
+      summary = Metrics.run_metrics_refresh(
+         Metrics.MetricsConfig(
+            db_path=db_path,
+            score_start_season=2024,
+            min_shots_for_comparison=1,
+            validation_split=0.2,
+         )
+      )
+
+      self.assertEqual(summary["scored_seasons"], ["2024"])
+
+      with sqlite3.connect(db_path) as connection:
+         row = connection.execute(
+            """
+            SELECT shooter, games, toi
+            FROM player_season_advanced_metrics
+            WHERE shooter_id = 101
+            ORDER BY season DESC
+            LIMIT 1
+            """
+         ).fetchone()
+
+      self.assertIsNotNone(row)
+      self.assertEqual(row[0], "Real Player A")
+      self.assertEqual(row[1], 10)
+      self.assertGreater(row[2], 0)
+
    def test_metrics_refresh_creates_derived_outputs(self):
       db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_metrics_{uuid.uuid4().hex}.db")
       Main.initialize_database(db_path)
