@@ -777,7 +777,8 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
    placeholders = ",".join("?" for _ in seasons)
    query = f"""
       SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
-             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle
+             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
+             prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})
         AND shot_result IN ('Goal', 'ngshot')
@@ -793,6 +794,8 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
    shot_types = sorted({(row["shot_type"] or "Unknown").strip() for row in rows})
    strength_states = sorted({(row["strength_state"] or "Unknown").strip() for row in rows})
    zones = sorted({(row["zone"] or "Unknown").strip() for row in rows})
+   # Prior event types from play-by-play data
+   prior_event_types = sorted({(row["prev_event_type"] or "Unknown").strip() for row in rows if row["prev_event_type"]})
    return {
       "numeric": [
          "shot_distance",
@@ -800,7 +803,6 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
          "score_differential",
          "period",
          "home_away",
-         "distance_squared",
          "angle_squared",
          "distance_times_angle",
          "log_shot_distance",
@@ -810,10 +812,14 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
          "leading_by_two_plus",
          "is_power_play_for",
          "is_short_handed",
+         "seconds_since_last_event",
+         "puck_velocity",
+         "crossed_royal_road",
       ],
       "shot_type": shot_types,
       "strength_state": strength_states,
       "zone": zones,
+      "prior_event_type": prior_event_types,
    }
 
 
@@ -839,11 +845,15 @@ def _vectorize_rows(
    strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
    zone_to_idx = {value: idx for idx, value in enumerate(feature_spec["zone"])}
 
-   cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx)
+   cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx) + len(feature_spec.get("prior_event_type", []))
 
    use_entities = shooter_encoder is not None or goalie_encoder is not None
    shooter_ids_raw: list[str] = []
    goalie_ids_raw: list[str] = []
+
+   # Build prior event type encoder
+   prior_event_types = feature_spec.get("prior_event_type", [])
+   prior_event_type_to_idx = {value: idx for idx, value in enumerate(prior_event_types)}
 
    for row in rows:
       dist = _safe_float(row["shot_distance"], default=float("nan"))
@@ -861,7 +871,6 @@ def _vectorize_rows(
          _safe_float(row["score_differential"], 0.0),
          _safe_float(row["period"], 0.0),
          _safe_float(row["home_away"], 0.0),
-         dist * dist,
          angle * angle,
          dist * angle,
          math.log(max(dist, 1.0)),
@@ -871,6 +880,9 @@ def _vectorize_rows(
          1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
          1.0 if str(row["strength_state"] or "").startswith("5v4") else 0.0,
          1.0 if str(row["strength_state"] or "").startswith("4v5") else 0.0,
+         _safe_float(row["seconds_since_last_event"], 0.0),
+         _safe_float(row["puck_velocity"], 0.0),
+         1.0 if row["crossed_royal_road"] else 0.0,
       ]
       numeric_matrix.append(numeric_values)
 
@@ -878,6 +890,7 @@ def _vectorize_rows(
       shot_type = (row["shot_type"] or "Unknown").strip()
       strength = (row["strength_state"] or "Unknown").strip()
       zone = (row["zone"] or "Unknown").strip()
+      prior_event = (row["prev_event_type"] or "Unknown").strip()
 
       offset = 0
       if shot_type in shot_type_to_idx:
@@ -890,6 +903,10 @@ def _vectorize_rows(
 
       if zone in zone_to_idx:
          category_vec[offset + zone_to_idx[zone]] = 1.0
+      offset += len(zone_to_idx)
+
+      if prior_event in prior_event_type_to_idx:
+         category_vec[offset + prior_event_type_to_idx[prior_event]] = 1.0
 
       categorical_matrix.append(category_vec)
       labels.append(1.0 if row["shot_result"] == "Goal" else 0.0)
@@ -921,6 +938,7 @@ def _vectorize_rows(
    feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
    feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
    feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
+   feature_names.extend([f"prior_event_type::{value}" for value in feature_spec.get("prior_event_type", [])])
 
    if use_entities:
       feature_names.append("shooter_id_encoded")
@@ -973,7 +991,7 @@ def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[
    query = f"""
       SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
              score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
-             shooter_id, goalie_id
+             shooter_id, goalie_id, prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})
         AND shot_result IN ('Goal', 'ngshot')

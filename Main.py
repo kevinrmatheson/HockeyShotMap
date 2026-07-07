@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import time
 from collections.abc import Iterator
@@ -140,6 +141,12 @@ def edge_supported_for_season(season: str) -> bool:
    return int(season) >= EDGE_DATA_START_SEASON
 
 
+def resolve_capture_edge_setting(season: str, requested_capture_edge: bool | None) -> bool:
+   if requested_capture_edge is None:
+      return edge_supported_for_season(season)
+   return requested_capture_edge
+
+
 def _home_away_value(team_code: str | None, home_code: str | None, away_code: str | None) -> int | None:
    # Keep existing convention: 1 for home, 0 for away, None if unknown.
    if team_code and home_code and team_code == home_code:
@@ -212,6 +219,32 @@ def _coerce_bool_int(value: object | None) -> int | None:
    if text in {"false", "f", "no", "n", "0"}:
       return 0
    return None
+
+
+def _period_time_to_seconds(value: object | None) -> int | None:
+   if value is None:
+      return None
+   text = str(value).strip()
+   if not text or ":" not in text:
+      return None
+   minutes_text, seconds_text = text.split(":", 1)
+   try:
+      minutes = int(minutes_text)
+      seconds = int(seconds_text)
+   except ValueError:
+      return None
+   if minutes < 0 or seconds < 0:
+      return None
+   return minutes * 60 + seconds
+
+
+def _derived_distance_and_angle(x_coord: float, y_coord: float) -> tuple[float, float]:
+   # Approximate distance/angle to the attacking net using the nearest net at +/-89 feet.
+   net_x = 89.0
+   dx = abs(net_x - abs(x_coord))
+   distance = math.hypot(dx, y_coord)
+   angle = math.degrees(math.atan2(abs(y_coord), max(dx, 1e-6)))
+   return distance, angle
 
 
 def _season_id_yyyyyyyy(start_year: str) -> str:
@@ -417,6 +450,8 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
    )
    rows = []
    last_coord_event: dict[str, object] | None = None
+   home_score = 0
+   away_score = 0
    for _, play in ordered_plays:
       if not isinstance(play, dict):
          continue
@@ -425,6 +460,7 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
       details = play.get("details", {})
       about = play.get("about", {})
       period_descriptor = play.get("periodDescriptor", {})
+      home_team_defending_side = play.get("homeTeamDefendingSide") or game_json.get("homeTeamDefendingSide")
       x_coord = details.get("xCoord")
       y_coord = details.get("yCoord")
 
@@ -440,7 +476,11 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
             prev_event_type = last_coord_event.get("event_type")
             prev_event_x = last_coord_event.get("x")
             prev_event_y = last_coord_event.get("y")
-            current_seconds_remaining = _coerce_int(about.get("periodTimeRemainingSeconds"))
+            current_seconds_remaining = _first_non_none(
+               _coerce_int(about.get("periodTimeRemainingSeconds")),
+               _period_time_to_seconds(about.get("periodTimeRemaining")),
+               _period_time_to_seconds(play.get("timeRemaining")),
+            )
             previous_seconds_remaining = last_coord_event.get("seconds_remaining")
             if current_seconds_remaining is not None and isinstance(previous_seconds_remaining, int):
                prev_event_seconds_ago = abs(previous_seconds_remaining - current_seconds_remaining)
@@ -464,12 +504,31 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
          goalie_id = _coerce_int(_first_non_none(details.get("goalieInNetId"), details.get("goalieId")))
          period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
          period_time = _normalize_text(_first_non_none(about.get("periodTime"), play.get("periodTime")))
-         period_time_remaining = _normalize_text(_first_non_none(about.get("periodTimeRemaining"), play.get("periodTimeRemaining")))
+         period_time_remaining = _normalize_text(
+            _first_non_none(
+               about.get("periodTimeRemaining"),
+               play.get("periodTimeRemaining"),
+               play.get("timeRemaining"),
+            )
+         )
          shot_distance = _coerce_float(_first_non_none(details.get("shotDistance"), details.get("distanceFromNet"), details.get("distance")))
          shot_angle = _coerce_float(_first_non_none(details.get("shotAngle"), details.get("angleFromNet"), details.get("angle")))
+         if shot_distance is None or shot_angle is None:
+            derived_distance, derived_angle = _derived_distance_and_angle(float(x_coord), float(y_coord))
+            if shot_distance is None:
+               shot_distance = derived_distance
+            if shot_angle is None:
+               shot_angle = derived_angle
          is_empty_net = _coerce_bool_int(_first_non_none(details.get("emptyNet"), details.get("isEmptyNet"), details.get("empty_net")))
+         if is_empty_net is None and goalie_id is None:
+            is_empty_net = 1 if event_key == "goal" else None
          strength_state = _normalize_text(_first_non_none(details.get("strength"), details.get("situationCode"), play.get("situationCode")))
          score_differential = _coerce_int(_first_non_none(details.get("scoreDifferential"), details.get("goalDifferential"), play.get("scoreDifferential")))
+         if score_differential is None and isinstance(team_code, str):
+            if _home_away_value(team_code, home_code, away_code) == 1:
+               score_differential = home_score - away_score
+            elif _home_away_value(team_code, home_code, away_code) == 0:
+               score_differential = away_score - home_score
          zone = _normalize_text(_first_non_none(details.get("zone"), details.get("zoneCode"), play.get("zone"), play.get("zoneCode")))
          event_id = _coerce_int(_first_non_none(play.get("eventId"), details.get("eventId")))
 
@@ -505,12 +564,22 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
             }
          )
 
+         if event_key == "goal":
+            if _home_away_value(team_code, home_code, away_code) == 1:
+               home_score += 1
+            elif _home_away_value(team_code, home_code, away_code) == 0:
+               away_score += 1
+
       if x_coord is not None and y_coord is not None:
          last_coord_event = {
             "event_type": event_key or None,
             "x": float(x_coord),
             "y": float(y_coord),
-            "seconds_remaining": _coerce_int(about.get("periodTimeRemainingSeconds")),
+            "seconds_remaining": _first_non_none(
+               _coerce_int(about.get("periodTimeRemainingSeconds")),
+               _period_time_to_seconds(about.get("periodTimeRemaining")),
+               _period_time_to_seconds(play.get("timeRemaining")),
+            ),
          }
 
    return rows
@@ -544,6 +613,19 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
       if x_coord is None or y_coord is None:
          continue
 
+      # Extract additional fields from stats API
+      shot_distance = _coerce_float(record.get("shotDistance") or record.get("distance"))
+      shot_angle = _coerce_float(record.get("shotAngle") or record.get("angle"))
+      is_empty_net = _coerce_bool_int(record.get("emptyNet") or record.get("isEmptyNet"))
+      strength_state = _normalize_text(record.get("strength") or record.get("situationCode"))
+      score_differential = _coerce_int(record.get("scoreDifferential") or record.get("goalDifferential"))
+      zone = _normalize_text(record.get("zone") or record.get("zoneCode"))
+      event_id = _coerce_int(record.get("eventId"))
+      shooter_id = _coerce_int(record.get("playerId"))
+      goalie_id = _coerce_int(record.get("goalieId"))
+      period_time = _normalize_text(record.get("periodTime"))
+      period_time_remaining = _normalize_text(record.get("periodTimeRemaining"))
+
       rows.append(
          {
             "Shot": "Goal" if "goal" in event_type else "ngshot",
@@ -551,12 +633,23 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
             "Y": float(y_coord),
             "Shot_Type": record.get("shotType") or "Unknown",
             "Shooter": record.get("playerName") or record.get("lastName") or "Unknown",
+            "Shooter_ID": shooter_id,
             "Team": record.get("teamAbbrev") or record.get("teamTriCode"),
             "Home_Away": None,
             "Period": record.get("period"),
+            "Period_Time": period_time,
+            "Period_Time_Remaining": period_time_remaining,
             "Year": season,
             "GameID": game_id,
             "API_Source": "stats",
+            "Goalie_ID": goalie_id,
+            "Shot_Distance": shot_distance,
+            "Shot_Angle": shot_angle,
+            "Is_Empty_Net": is_empty_net,
+            "Strength_State": strength_state,
+            "Score_Differential": score_differential,
+            "Zone": zone,
+            "Event_ID": event_id,
             "Prev_Event_Type": None,
             "Prev_Event_X": None,
             "Prev_Event_Y": None,
@@ -567,15 +660,6 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
    return rows
 
 
-def _event_hash(row: dict) -> str:
-   # Deterministic signature used to make reruns idempotent.
-   signature = (
-      f"{row['Year']}|{row['GameID']}|{row['Period']}|{row['Team']}|{row['Shooter']}|"
-      f"{row['X']}|{row['Y']}|{row['Shot_Type']}|{row['Shot']}"
-   )
-   return hashlib.sha256(signature.encode("utf-8")).hexdigest()
-
-
 def initialize_database(db_path: str) -> None:
    # Create storage table once; safe to call on every run.
    with sqlite3.connect(db_path) as connection:
@@ -584,7 +668,7 @@ def initialize_database(db_path: str) -> None:
          """
          CREATE TABLE IF NOT EXISTS shots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_hash TEXT NOT NULL UNIQUE,
+            event_hash TEXT NOT NULL,
             shot_result TEXT NOT NULL,
             x REAL NOT NULL,
             y REAL NOT NULL,
@@ -618,6 +702,8 @@ def initialize_database(db_path: str) -> None:
       # Backward-compatible migration for existing databases.
       cursor.execute("PRAGMA table_info(shots)")
       columns = {row[1] for row in cursor.fetchall()}
+      if "event_hash" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN event_hash TEXT")
       if "api_source" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN api_source TEXT NOT NULL DEFAULT 'web'")
       if "shooter_id" not in columns:
@@ -653,6 +739,7 @@ def initialize_database(db_path: str) -> None:
       if "prev_event_seconds_ago" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN prev_event_seconds_ago INTEGER")
 
+      cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shots_event_hash ON shots(event_hash)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_season ON shots(season)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_team ON shots(team)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_shooter ON shots(shooter)")
@@ -897,6 +984,15 @@ def _iter_game_rows_parallel(
             next_index += 1
 
 
+def _event_hash(row: dict) -> str:
+   # Deterministic signature used to uniquely identify shots.
+   signature = (
+      f"{row['Year']}|{row['GameID']}|{row['Period']}|{row['Team']}|{row['Shooter']}|"
+      f"{row['X']}|{row['Y']}|{row['Shot_Type']}|{row['Shot']}"
+   )
+   return hashlib.sha256(signature.encode("utf-8")).hexdigest()
+
+
 def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
    if not rows:
       return 0
@@ -951,55 +1047,48 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          y = excluded.y,
          shot_type = excluded.shot_type,
          shooter = excluded.shooter,
-         shooter_id = excluded.shooter_id,
+         shooter_id = COALESCE(excluded.shooter_id, shots.shooter_id),
          team = excluded.team,
-         home_away = excluded.home_away,
-         period = excluded.period,
-         period_time = excluded.period_time,
-         period_time_remaining = excluded.period_time_remaining,
+         home_away = COALESCE(excluded.home_away, shots.home_away),
+         period = COALESCE(excluded.period, shots.period),
+         period_time = COALESCE(excluded.period_time, shots.period_time),
+         period_time_remaining = COALESCE(excluded.period_time_remaining, shots.period_time_remaining),
          season = excluded.season,
          game_id = excluded.game_id,
-         api_source = excluded.api_source,
-         goalie = excluded.goalie,
-         goalie_id = excluded.goalie_id,
-         shot_distance = excluded.shot_distance,
-         shot_angle = excluded.shot_angle,
-         is_empty_net = excluded.is_empty_net,
-         strength_state = excluded.strength_state,
-         score_differential = excluded.score_differential,
-         zone = excluded.zone,
-         event_id = excluded.event_id,
-         prev_event_type = excluded.prev_event_type,
-         prev_event_x = excluded.prev_event_x,
-         prev_event_y = excluded.prev_event_y,
-         prev_event_seconds_ago = excluded.prev_event_seconds_ago
-      WHERE shot_result IS NOT excluded.shot_result
-         OR x IS NOT excluded.x
-         OR y IS NOT excluded.y
-         OR shot_type IS NOT excluded.shot_type
-         OR shooter IS NOT excluded.shooter
-         OR shooter_id IS NOT excluded.shooter_id
-         OR team IS NOT excluded.team
-         OR home_away IS NOT excluded.home_away
-         OR period IS NOT excluded.period
-         OR period_time IS NOT excluded.period_time
-         OR period_time_remaining IS NOT excluded.period_time_remaining
-         OR season IS NOT excluded.season
-         OR game_id IS NOT excluded.game_id
-         OR api_source IS NOT excluded.api_source
-         OR goalie IS NOT excluded.goalie
-         OR goalie_id IS NOT excluded.goalie_id
-         OR shot_distance IS NOT excluded.shot_distance
-         OR shot_angle IS NOT excluded.shot_angle
-         OR is_empty_net IS NOT excluded.is_empty_net
-         OR strength_state IS NOT excluded.strength_state
-         OR score_differential IS NOT excluded.score_differential
-         OR zone IS NOT excluded.zone
-         OR event_id IS NOT excluded.event_id
-         OR prev_event_type IS NOT excluded.prev_event_type
-         OR prev_event_x IS NOT excluded.prev_event_x
-         OR prev_event_y IS NOT excluded.prev_event_y
-         OR prev_event_seconds_ago IS NOT excluded.prev_event_seconds_ago
+         api_source = COALESCE(shots.api_source, excluded.api_source),
+         goalie = COALESCE(excluded.goalie, shots.goalie),
+         goalie_id = COALESCE(excluded.goalie_id, shots.goalie_id),
+         shot_distance = COALESCE(excluded.shot_distance, shots.shot_distance),
+         shot_angle = COALESCE(excluded.shot_angle, shots.shot_angle),
+         is_empty_net = COALESCE(excluded.is_empty_net, shots.is_empty_net),
+         strength_state = COALESCE(excluded.strength_state, shots.strength_state),
+         score_differential = COALESCE(excluded.score_differential, shots.score_differential),
+         zone = COALESCE(excluded.zone, shots.zone),
+         event_id = COALESCE(excluded.event_id, shots.event_id),
+         prev_event_type = COALESCE(excluded.prev_event_type, shots.prev_event_type),
+         prev_event_x = COALESCE(excluded.prev_event_x, shots.prev_event_x),
+         prev_event_y = COALESCE(excluded.prev_event_y, shots.prev_event_y),
+         prev_event_seconds_ago = COALESCE(excluded.prev_event_seconds_ago, shots.prev_event_seconds_ago)
+      WHERE
+         COALESCE(excluded.shooter_id, shots.shooter_id) IS NOT shots.shooter_id
+         OR COALESCE(excluded.home_away, shots.home_away) IS NOT shots.home_away
+         OR COALESCE(excluded.period, shots.period) IS NOT shots.period
+         OR COALESCE(excluded.period_time, shots.period_time) IS NOT shots.period_time
+         OR COALESCE(excluded.period_time_remaining, shots.period_time_remaining) IS NOT shots.period_time_remaining
+         OR COALESCE(excluded.api_source, shots.api_source) IS NOT shots.api_source
+         OR COALESCE(excluded.goalie, shots.goalie) IS NOT shots.goalie
+         OR COALESCE(excluded.goalie_id, shots.goalie_id) IS NOT shots.goalie_id
+         OR COALESCE(excluded.shot_distance, shots.shot_distance) IS NOT shots.shot_distance
+         OR COALESCE(excluded.shot_angle, shots.shot_angle) IS NOT shots.shot_angle
+         OR COALESCE(excluded.is_empty_net, shots.is_empty_net) IS NOT shots.is_empty_net
+         OR COALESCE(excluded.strength_state, shots.strength_state) IS NOT shots.strength_state
+         OR COALESCE(excluded.score_differential, shots.score_differential) IS NOT shots.score_differential
+         OR COALESCE(excluded.zone, shots.zone) IS NOT shots.zone
+         OR COALESCE(excluded.event_id, shots.event_id) IS NOT shots.event_id
+         OR COALESCE(excluded.prev_event_type, shots.prev_event_type) IS NOT shots.prev_event_type
+         OR COALESCE(excluded.prev_event_x, shots.prev_event_x) IS NOT shots.prev_event_x
+         OR COALESCE(excluded.prev_event_y, shots.prev_event_y) IS NOT shots.prev_event_y
+         OR COALESCE(excluded.prev_event_seconds_ago, shots.prev_event_seconds_ago) IS NOT shots.prev_event_seconds_ago
       """,
       params,
    )
@@ -1612,7 +1701,19 @@ def parse_args() -> argparse.Namespace:
       help=f"Start season for multi-season run. Defaults to {COORDINATE_DATA_START_SEASON} (first reliable coordinate-data season) when --season is not used.",
    )
    parser.add_argument("--end-season", type=int, default=None, help="Optional end season for multi-season run. Defaults to current NHL season.")
-   parser.add_argument("--capture-edge", action="store_true", help="Capture NHL Edge summary payloads when web API is enabled.")
+   parser.add_argument(
+      "--capture-edge",
+      dest="capture_edge",
+      action="store_true",
+      default=None,
+      help="Capture NHL Edge summary payloads. Defaults to enabled for 2021+ seasons.",
+   )
+   parser.add_argument(
+      "--no-capture-edge",
+      dest="capture_edge",
+      action="store_false",
+      help="Disable NHL Edge summary payload capture, even for 2021+ seasons.",
+   )
    parser.add_argument("--capture-edge-deep", action="store_true", help="Capture NHL Edge team and player detail payloads after each season.")
    parser.add_argument("--game-type", default=REGULAR_SEASON, choices=[PRESEASON, REGULAR_SEASON, PLAYOFFS, ALLSTAR])
    parser.add_argument("--start-game", type=int, default=1)
@@ -1648,6 +1749,7 @@ def main() -> None:
 
    for season in seasons_to_run:
       logging.info("Starting season %s", season)
+      capture_edge = resolve_capture_edge_setting(season, args.capture_edge)
       config = ScrapeConfig(
          season=season,
          game_type=args.game_type,
@@ -1661,9 +1763,10 @@ def main() -> None:
       )
       season_sources = shot_sources_for_season(season)
       logging.info("Season %s uses shot sources: %s", season, ", ".join(season_sources))
+      logging.info("Season %s capture_edge=%s capture_edge_deep=%s", season, capture_edge, args.capture_edge_deep)
       games_processed, rows_inserted, edge_payloads, edge_detail_payloads, player_stats = run_season_scrape(
          config,
-         args.capture_edge,
+         capture_edge,
          args.capture_edge_deep,
       )
       total_games_processed += games_processed

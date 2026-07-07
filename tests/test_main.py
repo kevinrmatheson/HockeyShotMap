@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 import tempfile
 import unittest
 import uuid
@@ -183,6 +184,69 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(rows[0]["Prev_Event_X"], 18.0)
         self.assertEqual(rows[0]["Prev_Event_Y"], -3.0)
 
+    def test_parse_web_shot_events_derives_missing_2025_metadata(self):
+        payload = {
+            "homeTeam": {"abbrev": "TOR"},
+            "awayTeam": {"abbrev": "MTL"},
+            "plays": [
+                {
+                    "typeDescKey": "goal",
+                    "sortOrder": 10,
+                    "eventId": 301,
+                    "timeInPeriod": "00:05",
+                    "timeRemaining": "19:55",
+                    "periodDescriptor": {"number": 1},
+                    "homeTeamDefendingSide": "right",
+                    "details": {
+                        "xCoord": 20,
+                        "yCoord": 3,
+                        "shotType": "wrist",
+                        "eventOwnerTeamTricode": "TOR",
+                        "scoringPlayerName": "Scorer A",
+                    },
+                },
+                {
+                    "typeDescKey": "faceoff",
+                    "sortOrder": 20,
+                    "eventId": 302,
+                    "timeInPeriod": "00:10",
+                    "timeRemaining": "19:50",
+                    "periodDescriptor": {"number": 1},
+                    "homeTeamDefendingSide": "right",
+                    "details": {
+                        "xCoord": 0,
+                        "yCoord": 0,
+                    },
+                },
+                {
+                    "typeDescKey": "shot-on-goal",
+                    "sortOrder": 30,
+                    "eventId": 303,
+                    "timeInPeriod": "00:20",
+                    "timeRemaining": "19:40",
+                    "periodDescriptor": {"number": 1},
+                    "homeTeamDefendingSide": "right",
+                    "details": {
+                        "xCoord": -30,
+                        "yCoord": 10,
+                        "shotType": "wrist",
+                        "eventOwnerTeamTricode": "MTL",
+                        "shootingPlayerName": "Shooter B",
+                    },
+                },
+            ],
+        }
+
+        rows = Main.parse_web_shot_events(payload, "2025", 206)
+        self.assertEqual(len(rows), 2)
+
+        shot_row = rows[1]
+        self.assertEqual(shot_row["Prev_Event_Type"], "faceoff")
+        self.assertEqual(shot_row["Prev_Event_Seconds_Ago"], 10)
+        self.assertEqual(shot_row["Score_Differential"], -1)
+        self.assertAlmostEqual(shot_row["Shot_Distance"], 59.84, places=1)
+        self.assertAlmostEqual(shot_row["Shot_Angle"], 9.6, places=1)
+
     def test_persist_rows_updates_existing_row_with_previous_event_data(self):
         db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_prev_event_{uuid.uuid4().hex}.db")
         Main.initialize_database(db_path)
@@ -250,6 +314,27 @@ class TestMainPipeline(unittest.TestCase):
     def test_edge_supported_for_season_threshold(self):
         self.assertFalse(Main.edge_supported_for_season("2020"))
         self.assertTrue(Main.edge_supported_for_season("2021"))
+
+    def test_resolve_capture_edge_setting_defaults_by_season(self):
+        self.assertFalse(Main.resolve_capture_edge_setting("2020", None))
+        self.assertTrue(Main.resolve_capture_edge_setting("2021", None))
+        self.assertTrue(Main.resolve_capture_edge_setting("2025", None))
+
+    def test_resolve_capture_edge_setting_honors_explicit_override(self):
+        self.assertFalse(Main.resolve_capture_edge_setting("2025", False))
+        self.assertTrue(Main.resolve_capture_edge_setting("2020", True))
+
+    def test_parse_args_defaults_capture_edge_to_auto(self):
+        with patch.object(sys, "argv", ["Main.py"]):
+            args = Main.parse_args()
+
+        self.assertIsNone(args.capture_edge)
+
+    def test_parse_args_supports_no_capture_edge_override(self):
+        with patch.object(sys, "argv", ["Main.py", "--no-capture-edge"]):
+            args = Main.parse_args()
+
+        self.assertFalse(args.capture_edge)
 
     def test_edge_detail_url_builders(self):
         self.assertEqual(

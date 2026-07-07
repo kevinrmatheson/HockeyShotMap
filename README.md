@@ -98,13 +98,21 @@ Shot source behavior is hardcoded for simplicity:
 - Pre-2009 seasons use Stats REST shot parsing.
 - 2009+ seasons use Web API shot parsing with Stats REST fallback when a game returns no web shot rows.
 
-Capture NHL Edge snapshots for each scraped season:
+NHL Edge summary capture is enabled by default for 2021+ seasons.
+
+Capture NHL Edge snapshots explicitly for each scraped season:
 
 ```bash
 python Main.py --capture-edge
 ```
 
-EDGE capture is hardcoded to start at 2021+ seasons.
+Disable default EDGE summary capture for a run:
+
+```bash
+python Main.py --no-capture-edge
+```
+
+EDGE capture is hardcoded to start at 2021+ seasons when enabled.
 
 ## Player seasonal stats
 
