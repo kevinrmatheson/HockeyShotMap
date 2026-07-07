@@ -167,6 +167,10 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
        - 'y': puck y-coordinate (ice length, typically -200 to 200)
        - 'period': integer period number
        - 'game_id': unique game identifier
+       - 'prev_event_type': categorical string of the previous play (from Main.py)
+       - 'prev_event_x': x-coordinate of previous event (from Main.py)
+       - 'prev_event_y': y-coordinate of previous event (from Main.py)
+       - 'prev_event_seconds_ago': seconds since previous event (from Main.py)
 
    Returns
    -------
@@ -201,42 +205,26 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    # Main.py uses 'shot_result' values: 'Goal' or 'ngshot'
    is_shot = result['shot_result'].isin(['Goal', 'ngshot'])
 
-   # Shift columns to get prior row data
-   prior_period_time = result['period_time'].shift(1)
-   prior_x = result['x'].shift(1)
-   prior_y = result['y'].shift(1)
-   prior_event = result['event'].shift(1)
+   # Get prior event data from Main.py's already-computed columns
+   # These columns are populated by Main.py's parse_web_shot_events function
+   prior_event_type = result['prev_event_type'].shift(1)
+   prior_x = result['prev_event_x'].shift(1)
+   prior_y = result['prev_event_y'].shift(1)
+   prior_seconds_ago = result['prev_event_seconds_ago'].shift(1)
+
+   # Get current row's period and game_id for edge case safety
    prior_period = result['period'].shift(1)
    prior_game_id = result['game_id'].shift(1)
 
-   # Parse timestamps to seconds (format: 'M:SS')
-   def _parse_timestamp_to_seconds(ts: str) -> float:
-       """Parse 'M:SS' format timestamp to total seconds."""
-       if pd.isna(ts):
-           return 0.0
-       try:
-           parts = str(ts).split(':')
-           if len(parts) == 2:
-               return int(parts[0]) * 60 + int(parts[1])
-           return 0.0
-       except (ValueError, TypeError):
-           return 0.0
-
-   # Vectorized timestamp parsing
-   current_seconds = result['period_time'].apply(_parse_timestamp_to_seconds)
-   prior_seconds = prior_period_time.apply(_parse_timestamp_to_seconds)
-
-   # Calculate time delta
-   time_delta = current_seconds - prior_seconds
+   # Check if period and game_id match (edge case safety)
+   # This prevents data leakage across intermissions or games
+   period_matches = (result['period'] == prior_period) & (result['game_id'] == prior_game_id)
 
    # Calculate Euclidean distance between puck positions
    distance_delta = np.sqrt(
        (result['x'] - prior_x) ** 2 +
        (result['y'] - prior_y) ** 2
    )
-
-   # Check if period and game_id match (edge case safety)
-   period_matches = (result['period'] == prior_period) & (result['game_id'] == prior_game_id)
 
    # Royal road: crossed center line (y coordinates have different signs)
    crossed_royal_road = (prior_y * result['y']) < 0
@@ -245,13 +233,13 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    # For non-matching rows, keep default values (0/null)
    result['seconds_since_last_event'] = np.where(
        period_matches,
-       time_delta,
+       prior_seconds_ago,
        0.0
    )
 
    result['prior_event_type'] = np.where(
        period_matches,
-       prior_event,
+       prior_event_type,
        None
    )
 
@@ -263,14 +251,57 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
 
    # Calculate velocity (avoid division by zero)
    result['puck_velocity'] = np.where(
-       (period_matches) & (time_delta > 0),
-       distance_delta / time_delta,
+       (period_matches) & (prior_seconds_ago > 0),
+       distance_delta / prior_seconds_ago,
        0.0
    )
 
    result['crossed_royal_road'] = period_matches & crossed_royal_road
 
    return result
+
+
+def load_shots_for_prior_event_features(
+   connection: sqlite3.Connection,
+   seasons: list[str],
+) -> "pd.DataFrame":
+   """Load shots from database with all required columns for prior event feature engineering.
+
+   This function loads shot data from the database in the correct sequential order
+   (by game_id and period_time) for feature engineering.
+
+   Parameters
+   ----------
+   connection : sqlite3.Connection
+       Database connection to the hockey_data.db
+   seasons : list[str]
+       List of season strings to load (e.g., ['2023', '2024'])
+
+   Returns
+   -------
+   pd.DataFrame
+       DataFrame with shots ordered by game and time, ready for feature engineering.
+   """
+   import pandas as pd
+
+   placeholders = ",".join("?" for _ in seasons)
+   query = f"""
+      SELECT id, event_hash, season, game_id, shot_result, x, y,
+             period, period_time, period_time_remaining,
+             prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago,
+             shooter, shooter_id, team, home_away,
+             shot_type, shot_distance, shot_angle,
+             is_empty_net, strength_state, score_differential, zone, event_id
+      FROM shots
+      WHERE season IN ({placeholders})
+        AND shot_result IN ('Goal', 'ngshot')
+        AND x IS NOT NULL
+        AND y IS NOT NULL
+        AND COALESCE(is_empty_net, 0) = 0
+      ORDER BY game_id, period, period_time
+   """
+   df = pd.read_sql_query(query, connection, params=seasons)
+   return df
 
 
 def _temporal_split_indices(
