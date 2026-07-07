@@ -69,10 +69,12 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(rows[0]["API_Source"], "web")
         fetch_mock.assert_not_called()
 
-    def test_detect_available_sources_keeps_requested_on_partial_preflight_failure(self):
-        with patch("Main._fetch_json", side_effect=[None, {"ok": True}]):
-            sources = Main.detect_available_sources("both", 10)
-        self.assertEqual(sources, ["web", "stats"])
+    def test_shot_sources_for_season_pre_coordinate_era(self):
+        self.assertEqual(Main.shot_sources_for_season("2008"), ["stats"])
+
+    def test_shot_sources_for_season_coordinate_era_and_newer(self):
+        self.assertEqual(Main.shot_sources_for_season("2009"), ["web", "stats"])
+        self.assertEqual(Main.shot_sources_for_season("2024"), ["web", "stats"])
 
     def test_parse_web_shot_events(self):
         payload = {
@@ -142,6 +144,87 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(rows[1]["Score_Differential"], -1)
         self.assertEqual(rows[1]["Zone"], "DZ")
 
+    def test_parse_web_shot_events_captures_previous_coordinate_event(self):
+        payload = {
+            "homeTeam": {"abbrev": "TOR"},
+            "awayTeam": {"abbrev": "MTL"},
+            "plays": [
+                {
+                    "typeDescKey": "shot-on-goal",
+                    "sortOrder": 20,
+                    "eventId": 202,
+                    "periodDescriptor": {"number": 1},
+                    "about": {"periodTime": "01:00", "periodTimeRemaining": "19:00", "period": 1},
+                    "details": {
+                        "xCoord": 25,
+                        "yCoord": 4,
+                        "shotType": "Wrist",
+                        "eventOwnerTeamTricode": "TOR",
+                        "shootingPlayerName": "Shooter A",
+                    },
+                },
+                {
+                    "typeDescKey": "faceoff",
+                    "sortOrder": 10,
+                    "eventId": 201,
+                    "periodDescriptor": {"number": 1},
+                    "about": {"periodTime": "00:58", "periodTimeRemaining": "19:02", "period": 1},
+                    "details": {
+                        "xCoord": 18,
+                        "yCoord": -3,
+                    },
+                },
+            ],
+        }
+
+        rows = Main.parse_web_shot_events(payload, "2023", 205)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Prev_Event_Type"], "faceoff")
+        self.assertEqual(rows[0]["Prev_Event_X"], 18.0)
+        self.assertEqual(rows[0]["Prev_Event_Y"], -3.0)
+
+    def test_persist_rows_updates_existing_row_with_previous_event_data(self):
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_prev_event_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        base_row = {
+            "Shot": "Goal",
+            "X": 20.0,
+            "Y": -3.0,
+            "Shot_Type": "Wrist Shot",
+            "Shooter": "Test Shooter",
+            "Team": "TOR",
+            "Home_Away": 1,
+            "Period": 1,
+            "Year": "2013",
+            "GameID": 1,
+        }
+        enriched_row = dict(base_row)
+        enriched_row.update(
+            {
+                "Prev_Event_Type": "faceoff",
+                "Prev_Event_X": 12.0,
+                "Prev_Event_Y": -4.0,
+                "Prev_Event_Seconds_Ago": 6,
+            }
+        )
+
+        inserted_first = Main.persist_rows(db_path, [base_row])
+        inserted_second = Main.persist_rows(db_path, [enriched_row])
+
+        self.assertEqual(inserted_first, 1)
+        self.assertEqual(inserted_second, 1)
+
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "SELECT prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago, COUNT(*) FROM shots"
+            ).fetchone()
+        self.assertEqual(row[0], "faceoff")
+        self.assertEqual(row[1], 12.0)
+        self.assertEqual(row[2], -4.0)
+        self.assertEqual(row[3], 6)
+        self.assertEqual(row[4], 1)
+
     def test_roster_player_helpers(self):
         roster_payload = {
             "forwards": [
@@ -164,42 +247,9 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(Main._player_position_code(players[0]), "C")
         self.assertEqual(Main._player_position_code(players[1]), "G")
 
-    def test_edge_is_supported_for_season_true(self):
-        class FakeResponse:
-            status_code = 200
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {
-                    "seasonsWithEdgeStats": [
-                        {"id": 20212022, "gameTypes": [2, 3]},
-                        {"id": 20222023, "gameTypes": [2, 3]},
-                    ]
-                }
-
-        with patch.object(Main._HTTP_SESSION, "get", return_value=FakeResponse()):
-            supported = Main.edge_is_supported_for_season("2022", Main.REGULAR_SEASON, 10)
-        self.assertTrue(supported)
-
-    def test_edge_is_supported_for_season_false(self):
-        class FakeResponse:
-            status_code = 200
-
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return {
-                    "seasonsWithEdgeStats": [
-                        {"id": 20232024, "gameTypes": [2, 3]},
-                    ]
-                }
-
-        with patch.object(Main._HTTP_SESSION, "get", return_value=FakeResponse()):
-            supported = Main.edge_is_supported_for_season("2022", Main.REGULAR_SEASON, 10)
-        self.assertFalse(supported)
+    def test_edge_supported_for_season_threshold(self):
+        self.assertFalse(Main.edge_supported_for_season("2020"))
+        self.assertTrue(Main.edge_supported_for_season("2021"))
 
     def test_edge_detail_url_builders(self):
         self.assertEqual(
@@ -262,120 +312,6 @@ class TestMainPipeline(unittest.TestCase):
     def test_season_range_rejects_invalid_bounds(self):
         with self.assertRaises(ValueError):
             Main.season_range(2022, 2021)
-
-    def test_run_state_helpers_skip_completed_range(self):
-        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_runstate_{uuid.uuid4().hex}.db")
-        Main.initialize_database(db_path)
-
-        with sqlite3.connect(db_path) as connection:
-            cursor = connection.cursor()
-            Main._upsert_run_state(
-                cursor,
-                "2024",
-                Main.REGULAR_SEASON,
-                1,
-                10,
-                10,
-                10,
-                100,
-                "complete",
-            )
-            connection.commit()
-
-        self.assertTrue(Main._season_run_is_complete(db_path, "2024", Main.REGULAR_SEASON, 1, 10))
-        self.assertEqual(Main._resume_start_game(db_path, "2024", Main.REGULAR_SEASON, 1, 10), 11)
-        self.assertFalse(Main._season_run_is_complete(db_path, "2024", Main.REGULAR_SEASON, 1, 11))
-
-    def test_load_team_codes_for_season(self):
-        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_teamcodes_{uuid.uuid4().hex}.db")
-        Main.initialize_database(db_path)
-
-        rows = [
-            {
-                "Shot": "Goal",
-                "X": 20.0,
-                "Y": -3.0,
-                "Shot_Type": "Wrist Shot",
-                "Shooter": "A",
-                "Team": "tor",
-                "Home_Away": 1,
-                "Period": 1,
-                "Year": "2024",
-                "GameID": 1,
-            },
-            {
-                "Shot": "ngshot",
-                "X": 10.0,
-                "Y": 5.0,
-                "Shot_Type": "Slap",
-                "Shooter": "B",
-                "Team": " TOR ",
-                "Home_Away": 0,
-                "Period": 2,
-                "Year": "2024",
-                "GameID": 2,
-            },
-            {
-                "Shot": "ngshot",
-                "X": 15.0,
-                "Y": 7.0,
-                "Shot_Type": "Backhand",
-                "Shooter": "C",
-                "Team": "MTL",
-                "Home_Away": 0,
-                "Period": 2,
-                "Year": "2024",
-                "GameID": 3,
-            },
-        ]
-        Main.persist_rows(db_path, rows)
-
-        team_codes = Main._load_team_codes_for_season(db_path, "2024")
-        self.assertEqual(team_codes, {"TOR", "MTL"})
-
-    def test_run_edge_capture_only_summary_and_deep(self):
-        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_edgeonly_{uuid.uuid4().hex}.db")
-        Main.initialize_database(db_path)
-        Main.persist_rows(
-            db_path,
-            [
-                {
-                    "Shot": "Goal",
-                    "X": 20.0,
-                    "Y": -3.0,
-                    "Shot_Type": "Wrist Shot",
-                    "Shooter": "Test Shooter",
-                    "Team": "TOR",
-                    "Home_Away": 1,
-                    "Period": 1,
-                    "Year": "2024",
-                    "GameID": 1,
-                }
-            ],
-        )
-
-        config = Main.ScrapeConfig(
-            season="2024",
-            game_type=Main.REGULAR_SEASON,
-            start_game=1,
-            end_game=1,
-            timeout_seconds=10,
-            db_path=db_path,
-        )
-
-        with patch("Main.edge_is_supported_for_season", return_value=True), patch("Main.capture_edge_summary_snapshots", return_value=3), patch("Main.capture_edge_deep_snapshots", return_value=5) as deep_mock:
-            edge_payloads, edge_detail_payloads = Main.run_edge_capture_only(
-                config,
-                ["web"],
-                capture_edge=True,
-                capture_edge_deep=True,
-            )
-
-        self.assertEqual(edge_payloads, 3)
-        self.assertEqual(edge_detail_payloads, 5)
-        deep_mock.assert_called_once()
-        self.assertEqual(deep_mock.call_args.args[4], {"TOR"})
-
 
 if __name__ == "__main__":
     unittest.main()

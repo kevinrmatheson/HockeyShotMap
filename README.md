@@ -42,10 +42,10 @@ The Edge data families are useful if you want to enrich the shot feed later:
 
 Pipeline flow:
 
-1. Build game URLs for one or both NHL API families.
-2. Fetch JSON from selected source(s):
-	- NHL Web API / Gamecenter (`api-web.nhle.com`)
-	- NHL Stats REST API (`api.nhle.com/stats/rest`)
+1. Build game URLs using season-based source rules.
+2. Fetch JSON from NHL API families based on season:
+	- Pre-2009 seasons: NHL Stats REST API only
+	- 2009+ seasons: NHL Web API / Gamecenter first, with NHL Stats REST fallback
 3. Parse `Goal` and `Shot` events into normalized rows.
 4. Persist rows into SQLite with duplicate-safe inserts.
 5. Optionally capture NHL Edge summary payloads.
@@ -93,24 +93,18 @@ python Main.py --start-season 2008 --end-season 2008 --empty-game-streak 500
 
 When a specific game, team, or player endpoint does not exist for a season (for example expansion-era teams in earlier years), 404 responses are treated as optional and skipped so the scrape can continue.
 
-Use only one source explicitly:
+Shot source behavior is hardcoded for simplicity:
 
-```bash
-python Main.py --api-source web
-python Main.py --api-source stats
-```
-
-Use both sources (recommended for capture completeness):
-
-```bash
-python Main.py --api-source both
-```
+- Pre-2009 seasons use Stats REST shot parsing.
+- 2009+ seasons use Web API shot parsing with Stats REST fallback when a game returns no web shot rows.
 
 Capture NHL Edge snapshots for each scraped season:
 
 ```bash
-python Main.py --api-source both --capture-edge
+python Main.py --capture-edge
 ```
+
+EDGE capture is hardcoded to start at 2021+ seasons.
 
 ## Player seasonal stats
 
@@ -151,28 +145,28 @@ This will automatically:
 
 The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2009 onward — though the Stats REST skater/goalie summary endpoints reach back much earlier).
 
-Run an EDGE-only pass (no shot scraping):
+Run summary EDGE capture for a single season:
 
 ```bash
-python Main.py --api-source web --edge-only --capture-edge --season 2024
+python Main.py --capture-edge --season 2024
 ```
 
-Run a deep EDGE-only pass (no shot scraping):
+Run deep EDGE capture for a single season:
 
 ```bash
-python Main.py --api-source web --edge-only --capture-edge-deep --season 2024
+python Main.py --capture-edge-deep --season 2024
 ```
 
-Run summary and deep EDGE in one pass (still no shot scraping):
+Run summary and deep EDGE capture in one pass:
 
 ```bash
-python Main.py --api-source web --edge-only --capture-edge --capture-edge-deep --season 2024
+python Main.py --capture-edge --capture-edge-deep --season 2024
 ```
 
 Capture the deeper Edge crawl too:
 
 ```bash
-python Main.py --api-source both --capture-edge --capture-edge-deep
+python Main.py --capture-edge --capture-edge-deep
 ```
 
 Run a bounded season range:
