@@ -16,6 +16,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
+from age_model import (
+   _build_age_xg_curve,
+   _player_trend_multiplier,
+   compute_age_adjusted_gax,
+   compute_age_adjusted_gax_per_60,
+)
+
 
 @dataclass
 class MetricsConfig:
@@ -39,8 +46,7 @@ class MetricsConfig:
    xgb_min_child_weight: float = 1.0
    use_player_effects: bool = True
    career_lookback_seasons: int = 3
-   # New options for enhanced metrics
-   include_opponent_strength: bool = True  # Include opponent team/goalie strength as features
+   # Options for enhanced metrics
    compute_rate_metrics: bool = True  # Compute per-60 rate metrics
    rolling_window_seasons: int = 3  # Number of seasons for rolling benchmarks
    include_age_adjusted: bool = True  # Age-adjusted career trajectory comparisons
@@ -144,151 +150,127 @@ def _load_player_seasonal_stats(
    return stats
 
 
-def _build_age_xg_curve(player_season_data: dict[int, dict[str, dict]]) -> callable:
-   """Fit a smooth league-wide xG-per-game age curve.
+def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
+   """Engineer continuous 'Prior Event' and 'Royal Road' features from NHL play-by-play data.
 
-   The curve is intentionally low-dimensional (4th-degree polynomial with
-   ridge regularization) so it captures broad lifecycle shape without
-   overfitting noise from a single season.
+   This function processes a sequentially ordered NHL play-by-play DataFrame and calculates
+   features for each shot-on-goal event based on the immediately preceding event.
+
+   Parameters
+   ----------
+   df : pd.DataFrame
+       NHL play-by-play DataFrame, sequentially ordered by game and time.
+       Required columns (as produced by Main.py):
+       - 'shot_result': event type ('Goal' or 'ngshot')
+       - 'period_time': time string in 'M:SS' format (e.g., '11:22')
+       - 'x': puck x-coordinate (ice width, typically -100 to 100)
+       - 'y': puck y-coordinate (ice length, typically -200 to 200)
+       - 'period': integer period number
+       - 'game_id': unique game identifier
+
+   Returns
+   -------
+   pd.DataFrame
+       Input DataFrame with additional engineered columns:
+       - 'seconds_since_last_event': time delta in seconds from prior event
+       - 'prior_event_type': categorical string of previous play
+       - 'puck_distance_delta': Euclidean distance puck traveled from prior event
+       - 'puck_velocity': distance_delta / time_delta (0 if time_delta == 0)
+       - 'crossed_royal_road': boolean, True if puck crossed center line
+
+   Notes
+   -----
+   - Only rows where shot_result is 'Goal' or 'ngshot' get meaningful feature values.
+   - Rows where period or game_id differ from prior row get default values (0/null)
+     to prevent data leakage across intermissions or games.
+   - Uses vectorized pandas operations for performance.
    """
-   # Prior lifecycle curve (relative scale) matching typical NHL development:
-   # rapid growth early 20s, prime plateau, slow decline, then steeper decline.
-   prior_points = {
-      18: 0.68,
-      20: 0.80,
-      22: 0.92,
-      24: 1.00,
-      27: 1.02,
-      30: 0.98,
-      33: 0.90,
-      36: 0.76,
-      39: 0.60,
-   }
+   import pandas as pd
 
-   def _prior_curve(age: float) -> float:
-      clamped = float(np.clip(age, 18.0, 39.0))
-      low = int(np.floor(clamped))
-      high = int(np.ceil(clamped))
-      low_anchor = max(k for k in prior_points if k <= low)
-      high_anchor = min(k for k in prior_points if k >= high)
-      if low_anchor == high_anchor:
-         return float(prior_points[low_anchor])
-      low_val = float(prior_points[low_anchor])
-      high_val = float(prior_points[high_anchor])
-      span = float(high_anchor - low_anchor)
-      t = (clamped - float(low_anchor)) / span if span else 0.0
-      return float(low_val + t * (high_val - low_val))
+   # Create a copy to avoid modifying the original
+   result = df.copy()
 
-   age_samples: list[float] = []
-   xg_per_game_samples: list[float] = []
-   sample_weights: list[float] = []
+   # Initialize new columns with default values
+   result['seconds_since_last_event'] = 0.0
+   result['prior_event_type'] = None
+   result['puck_distance_delta'] = 0.0
+   result['puck_velocity'] = 0.0
+   result['crossed_royal_road'] = False
 
-   for season_map in player_season_data.values():
-      for data in season_map.values():
-         age = int(data.get("age") or 0)
-         games = int(data.get("games") or 0)
-         xg = float(data.get("xg") or 0.0)
-         if age <= 0 or games <= 0:
-            continue
-         xg_per_game = xg / games
-         age_samples.append(float(age))
-         xg_per_game_samples.append(float(xg_per_game))
-         sample_weights.append(float(min(games, 82)))
+   # Identify shot-on-goal/goal rows (events that are shots)
+   # Main.py uses 'shot_result' values: 'Goal' or 'ngshot'
+   is_shot = result['shot_result'].isin(['Goal', 'ngshot'])
 
-   if len(age_samples) < 20:
-      return _prior_curve
+   # Shift columns to get prior row data
+   prior_period_time = result['period_time'].shift(1)
+   prior_x = result['x'].shift(1)
+   prior_y = result['y'].shift(1)
+   prior_event = result['event'].shift(1)
+   prior_period = result['period'].shift(1)
+   prior_game_id = result['game_id'].shift(1)
 
-   x = np.asarray(age_samples, dtype=float)
-   y = np.asarray(xg_per_game_samples, dtype=float)
-   w = np.asarray(sample_weights, dtype=float)
+   # Parse timestamps to seconds (format: 'M:SS')
+   def _parse_timestamp_to_seconds(ts: str) -> float:
+       """Parse 'M:SS' format timestamp to total seconds."""
+       if pd.isna(ts):
+           return 0.0
+       try:
+           parts = str(ts).split(':')
+           if len(parts) == 2:
+               return int(parts[0]) * 60 + int(parts[1])
+           return 0.0
+       except (ValueError, TypeError):
+           return 0.0
 
-   # Polynomial basis centered at league-prime-ish age to improve stability.
-   centered = x - 27.0
-   design = np.column_stack(
-      [
-         np.ones_like(centered),
-         centered,
-         centered**2,
-         centered**3,
-         centered**4,
-      ]
+   # Vectorized timestamp parsing
+   current_seconds = result['period_time'].apply(_parse_timestamp_to_seconds)
+   prior_seconds = prior_period_time.apply(_parse_timestamp_to_seconds)
+
+   # Calculate time delta
+   time_delta = current_seconds - prior_seconds
+
+   # Calculate Euclidean distance between puck positions
+   distance_delta = np.sqrt(
+       (result['x'] - prior_x) ** 2 +
+       (result['y'] - prior_y) ** 2
    )
 
-   sqrt_w = np.sqrt(np.clip(w, 1.0, None))
-   wx = design * sqrt_w[:, None]
-   wy = y * sqrt_w
-   ridge_lambda = 0.08
-   ridge = ridge_lambda * np.eye(design.shape[1])
+   # Check if period and game_id match (edge case safety)
+   period_matches = (result['period'] == prior_period) & (result['game_id'] == prior_game_id)
 
-   try:
-      beta = np.linalg.solve(wx.T @ wx + ridge, wx.T @ wy)
-   except np.linalg.LinAlgError:
-      beta = np.linalg.lstsq(wx, wy, rcond=None)[0]
+   # Royal road: crossed center line (y coordinates have different signs)
+   crossed_royal_road = (prior_y * result['y']) < 0
 
-   fit_grid = {age: max(float(np.asarray([1.0, age - 27.0, (age - 27.0) ** 2, (age - 27.0) ** 3, (age - 27.0) ** 4]) @ beta), 0.02)
-               for age in range(18, 41)}
-   fit_peak = max(fit_grid.values()) if fit_grid else 1.0
-   prior_peak = max(_prior_curve(float(age)) for age in range(24, 31))
+   # Apply edge case safety: only use computed values when period/game_id match
+   # For non-matching rows, keep default values (0/null)
+   result['seconds_since_last_event'] = np.where(
+       period_matches,
+       time_delta,
+       0.0
+   )
 
-   def _curve(age: float) -> float:
-      clamped_age = float(np.clip(age, 18.0, 40.0))
-      c = clamped_age - 27.0
-      features = np.asarray([1.0, c, c**2, c**3, c**4], dtype=float)
-      fit_value = max(float(features @ beta), 0.02)
+   result['prior_event_type'] = np.where(
+       period_matches,
+       prior_event,
+       None
+   )
 
-      # Blend empirical fit with lifecycle prior so single-season noise does
-      # not invert early-career growth or overstate late decline.
-      fit_relative = fit_value / max(fit_peak, 1e-6)
-      prior_relative = _prior_curve(clamped_age) / max(prior_peak, 1e-6)
-      blended_relative = (0.45 * fit_relative) + (0.55 * prior_relative)
-      return float(np.clip(blended_relative, 0.45, 1.10))
+   result['puck_distance_delta'] = np.where(
+       period_matches,
+       distance_delta,
+       0.0
+   )
 
-   return _curve
+   # Calculate velocity (avoid division by zero)
+   result['puck_velocity'] = np.where(
+       (period_matches) & (time_delta > 0),
+       distance_delta / time_delta,
+       0.0
+   )
 
+   result['crossed_royal_road'] = period_matches & crossed_royal_road
 
-def _player_trend_multiplier(season_map: dict[str, dict], season: str) -> float:
-   """Compute a player-specific trajectory multiplier from recent xG/GAX trend."""
-   seasons_sorted = sorted(season_map.keys())
-   if season not in seasons_sorted:
-      return 1.0
-
-   current_idx = seasons_sorted.index(season)
-   history = seasons_sorted[max(0, current_idx - 3):current_idx + 1]
-   if len(history) < 2:
-      return 1.0
-
-   x_vals = np.arange(len(history), dtype=float)
-   xg_pg_vals: list[float] = []
-   gax_pg_vals: list[float] = []
-   for hs in history:
-      data = season_map[hs]
-      games = max(int(data.get("games") or 0), 1)
-      xg_pg_vals.append(float(data.get("xg") or 0.0) / float(games))
-      gax_pg_vals.append(float(data.get("gax") or 0.0) / float(games))
-
-   xg_slope = float(np.polyfit(x_vals, np.asarray(xg_pg_vals, dtype=float), 1)[0])
-   gax_slope = float(np.polyfit(x_vals, np.asarray(gax_pg_vals, dtype=float), 1)[0])
-
-   # Positive trends (including elite outliers aging well) reduce decline.
-   xg_component = 0.10 * float(np.tanh(xg_slope / 0.03))
-   gax_component = 0.12 * float(np.tanh(gax_slope / 0.04))
-   return float(np.clip(1.0 + xg_component + gax_component, 0.88, 1.20))
-
-
-def _apply_projection_factor(value: float, factor: float) -> float:
-   """Apply age projection factor while preserving intuitive direction.
-
-   For improving ages (factor > 1):
-   - positive GAX is boosted upward
-   - negative GAX is softened toward 0
-   For declining ages (factor < 1):
-   - positive GAX is damped
-   - negative GAX becomes more negative
-   """
-   if value >= 0:
-      return value * factor
-   safe_factor = max(factor, 1e-6)
-   return value / safe_factor
+   return result
 
 
 def _temporal_split_indices(
@@ -620,7 +602,6 @@ def _config_signature(config: MetricsConfig, train_seasons: list[str]) -> str:
       "xgb_min_child_weight": config.xgb_min_child_weight,
       "use_player_effects": config.use_player_effects,
       "career_lookback_seasons": config.career_lookback_seasons,
-      "include_opponent_strength": config.include_opponent_strength,
       "compute_rate_metrics": config.compute_rate_metrics,
       "rolling_window_seasons": config.rolling_window_seasons,
       "include_age_adjusted": config.include_age_adjusted,
@@ -810,139 +791,15 @@ def _vectorize_rows(
    feature_spec: dict,
    fit_scaler: bool,
    scaler: dict | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict, list[str]]:
-   numeric_matrix: list[list[float]] = []
-   categorical_matrix: list[list[float]] = []
-   labels: list[float] = []
-
-   shot_type_to_idx = {value: idx for idx, value in enumerate(feature_spec["shot_type"])}
-   strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
-   zone_to_idx = {value: idx for idx, value in enumerate(feature_spec["zone"])}
-
-   cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx)
-
-   for row in rows:
-      dist = _safe_float(row["shot_distance"], default=float("nan"))
-      angle = _safe_float(row["shot_angle"], default=float("nan"))
-      if math.isnan(dist) or math.isnan(angle):
-         dist_fallback, angle_fallback = _derived_distance_and_angle(_safe_float(row["x"]), _safe_float(row["y"]))
-         if math.isnan(dist):
-            dist = dist_fallback
-         if math.isnan(angle):
-            angle = angle_fallback
-
-      numeric_values = [
-         dist,
-         angle,
-         _safe_float(row["score_differential"], 0.0),
-         _safe_float(row["period"], 0.0),
-         _safe_float(row["home_away"], 0.0),
-         dist * dist,
-         angle * angle,
-         dist * angle,
-         math.log(max(dist, 1.0)),
-         1.0 if dist <= 20.0 and angle <= 45.0 else 0.0,
-         1.0 if dist <= 35.0 and angle <= 30.0 else 0.0,
-         1.0 if _safe_float(row["score_differential"], 0.0) <= -2.0 else 0.0,
-         1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
-         1.0 if str(row["strength_state"] or "").startswith("5v4") else 0.0,
-         1.0 if str(row["strength_state"] or "").startswith("4v5") else 0.0,
-      ]
-      numeric_matrix.append(numeric_values)
-
-      category_vec = [0.0] * cat_width
-      shot_type = (row["shot_type"] or "Unknown").strip()
-      strength = (row["strength_state"] or "Unknown").strip()
-      zone = (row["zone"] or "Unknown").strip()
-
-      offset = 0
-      if shot_type in shot_type_to_idx:
-         category_vec[offset + shot_type_to_idx[shot_type]] = 1.0
-      offset += len(shot_type_to_idx)
-
-      if strength in strength_to_idx:
-         category_vec[offset + strength_to_idx[strength]] = 1.0
-      offset += len(strength_to_idx)
-
-      if zone in zone_to_idx:
-         category_vec[offset + zone_to_idx[zone]] = 1.0
-
-      categorical_matrix.append(category_vec)
-      labels.append(1.0 if row["shot_result"] == "Goal" else 0.0)
-
-   numeric_array = np.array(numeric_matrix, dtype=np.float64)
-   categorical_array = np.array(categorical_matrix, dtype=np.float64)
-
-   if fit_scaler:
-      means = numeric_array.mean(axis=0)
-      stds = numeric_array.std(axis=0)
-      stds = np.where(stds < 1e-9, 1.0, stds)
-      scaler = {"means": means.tolist(), "stds": stds.tolist()}
-   if scaler is None:
-      raise ValueError("scaler must be provided when fit_scaler is False")
-
-   means_np = np.array(scaler["means"], dtype=np.float64)
-   stds_np = np.array(scaler["stds"], dtype=np.float64)
-   standardized_numeric = (numeric_array - means_np) / stds_np
-
-   features = np.concatenate([standardized_numeric, categorical_array], axis=1)
-   targets = np.array(labels, dtype=np.float64)
-   feature_names = list(feature_spec["numeric"])
-   feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
-   feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
-   feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
-   return features, targets, scaler, feature_names
-
-
-def _build_entity_maps(rows: list[sqlite3.Row]) -> tuple[LabelEncoder, LabelEncoder, np.ndarray, np.ndarray]:
-   """Build label encoders for shooter_id and goalie_id from training rows."""
-   shooter_ids_raw = []
-   goalie_ids_raw = []
-
-   for row in rows:
-      sid = row["shooter_id"]
-      gid = row["goalie_id"]
-      shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
-      goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
-
-   shooter_encoder = LabelEncoder()
-   goalie_encoder = LabelEncoder()
-
-   shooter_encoded = shooter_encoder.fit_transform(shooter_ids_raw)
-   goalie_encoded = goalie_encoder.fit_transform(goalie_ids_raw)
-
-   return shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded
-
-
-def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[str]) -> list[sqlite3.Row]:
-   """Load shot rows including shooter_id and goalie_id for player-adaptive modeling."""
-   placeholders = ",".join("?" for _ in seasons)
-   query = f"""
-      SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
-             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
-             shooter_id, goalie_id
-      FROM shots
-      WHERE season IN ({placeholders})
-        AND shot_result IN ('Goal', 'ngshot')
-        AND x IS NOT NULL
-        AND y IS NOT NULL
-        AND COALESCE(is_empty_net, 0) = 0
-        AND shooter_id IS NOT NULL
-        AND goalie_id IS NOT NULL
-   """
-   connection.row_factory = sqlite3.Row
-   return list(connection.execute(query, seasons).fetchall())
-
-
-def _vectorize_rows_with_entities(
-   rows: list[sqlite3.Row],
-   feature_spec: dict,
-   fit_scaler: bool,
-   scaler: dict | None = None,
    shooter_encoder: LabelEncoder | None = None,
    goalie_encoder: LabelEncoder | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict, list[str], np.ndarray, np.ndarray, LabelEncoder, LabelEncoder]:
-   """Vectorize rows including shooter_id and goalie_id as numeric entity features."""
+) -> tuple:
+   """Vectorize shot rows into feature matrix and target vector.
+
+   When shooter_encoder and goalie_encoder are provided, also encodes
+   shooter_id and goalie_id as entity features for player-adaptive modeling.
+   Returns (features, targets, scaler, feature_names, [shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder]).
+   """
    numeric_matrix: list[list[float]] = []
    categorical_matrix: list[list[float]] = []
    labels: list[float] = []
@@ -953,6 +810,7 @@ def _vectorize_rows_with_entities(
 
    cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx)
 
+   use_entities = shooter_encoder is not None or goalie_encoder is not None
    shooter_ids_raw: list[str] = []
    goalie_ids_raw: list[str] = []
 
@@ -1005,10 +863,11 @@ def _vectorize_rows_with_entities(
       categorical_matrix.append(category_vec)
       labels.append(1.0 if row["shot_result"] == "Goal" else 0.0)
 
-      sid = row["shooter_id"]
-      gid = row["goalie_id"]
-      shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
-      goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
+      if use_entities:
+         sid = row["shooter_id"]
+         gid = row["goalie_id"]
+         shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
+         goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
 
    numeric_array = np.array(numeric_matrix, dtype=np.float64)
    categorical_array = np.array(categorical_matrix, dtype=np.float64)
@@ -1027,36 +886,74 @@ def _vectorize_rows_with_entities(
 
    features = np.concatenate([standardized_numeric, categorical_array], axis=1)
    targets = np.array(labels, dtype=np.float64)
-
    feature_names = list(feature_spec["numeric"])
    feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
    feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
    feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
-   feature_names.append("shooter_id_encoded")
-   feature_names.append("goalie_id_encoded")
 
-   # Build or reuse label encoders
-   if fit_scaler or shooter_encoder is None or goalie_encoder is None:
-      shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded = _build_entity_maps(rows)
-   else:
-      try:
-         shooter_encoded = shooter_encoder.transform(shooter_ids_raw)
-      except ValueError:
-         shooter_encoder, _, shooter_encoded, _ = _build_entity_maps(rows)
-      try:
-         goalie_encoded = goalie_encoder.transform(goalie_ids_raw)
-      except ValueError:
-         _, goalie_encoder, _, goalie_encoded = _build_entity_maps(rows)
+   if use_entities:
+      feature_names.append("shooter_id_encoded")
+      feature_names.append("goalie_id_encoded")
 
-   entity_column = np.column_stack([shooter_encoded.astype(np.float64), goalie_encoded.astype(np.float64)])
-   features = np.concatenate([features, entity_column], axis=1)
+      # Build or reuse label encoders
+      if fit_scaler or shooter_encoder is None or goalie_encoder is None:
+         shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded = _build_entity_maps(rows)
+      else:
+         try:
+            shooter_encoded = shooter_encoder.transform(shooter_ids_raw)
+         except ValueError:
+            shooter_encoder, _, shooter_encoded, _ = _build_entity_maps(rows)
+         try:
+            goalie_encoded = goalie_encoder.transform(goalie_ids_raw)
+         except ValueError:
+            _, goalie_encoder, _, goalie_encoded = _build_entity_maps(rows)
 
-   return features, targets, scaler, feature_names, shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder
+      entity_column = np.column_stack([shooter_encoded.astype(np.float64), goalie_encoded.astype(np.float64)])
+      features = np.concatenate([features, entity_column], axis=1)
+
+      return features, targets, scaler, feature_names, shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder
+
+   return features, targets, scaler, feature_names
 
 
-def _sigmoid(values: np.ndarray) -> np.ndarray:
-   clipped = np.clip(values, -50.0, 50.0)
-   return 1.0 / (1.0 + np.exp(-clipped))
+def _build_entity_maps(rows: list[sqlite3.Row]) -> tuple[LabelEncoder, LabelEncoder, np.ndarray, np.ndarray]:
+   """Build label encoders for shooter_id and goalie_id from training rows."""
+   shooter_ids_raw = []
+   goalie_ids_raw = []
+
+   for row in rows:
+      sid = row["shooter_id"]
+      gid = row["goalie_id"]
+      shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
+      goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
+
+   shooter_encoder = LabelEncoder()
+   goalie_encoder = LabelEncoder()
+
+   shooter_encoded = shooter_encoder.fit_transform(shooter_ids_raw)
+   goalie_encoded = goalie_encoder.fit_transform(goalie_ids_raw)
+
+   return shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded
+
+
+def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[str]) -> list[sqlite3.Row]:
+   """Load shot rows including shooter_id and goalie_id for player-adaptive modeling."""
+   placeholders = ",".join("?" for _ in seasons)
+   query = f"""
+      SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
+             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
+             shooter_id, goalie_id
+      FROM shots
+      WHERE season IN ({placeholders})
+        AND shot_result IN ('Goal', 'ngshot')
+        AND x IS NOT NULL
+        AND y IS NOT NULL
+        AND COALESCE(is_empty_net, 0) = 0
+        AND shooter_id IS NOT NULL
+        AND goalie_id IS NOT NULL
+   """
+   connection.row_factory = sqlite3.Row
+   return list(connection.execute(query, seasons).fetchall())
 
 
 def _fit_xgboost_classifier(features: np.ndarray, targets: np.ndarray, config: MetricsConfig) -> XGBClassifier:
@@ -1997,22 +1894,9 @@ def _compute_player_season_advanced_metrics(
 
          # -- Age-adjusted metrics (data-driven age curve + player trend) --
          if include_age_adjusted and age > 0:
-            current_curve = age_xg_curve(float(age))
-            horizon_age = min(float(age + 3), 40.0)
-            future_curve = age_xg_curve(horizon_age)
-            base_age_factor = float(np.clip(future_curve / max(current_curve, 1e-6), 0.75, 1.30))
-
             trend_factor = _player_trend_multiplier(season_map, season)
-            age_factor = float(np.clip(base_age_factor * trend_factor, 0.70, 1.35))
-
-            # Young players should carry explicit upside unless the age is unknown.
-            if age <= 22:
-               age_factor = max(age_factor, 1.05)
-            elif age <= 24:
-               age_factor = max(age_factor, 1.00)
-
-            age_adjusted_gax_per_60 = _apply_projection_factor(gax_per_60, age_factor)
-            age_adjusted_gax = _apply_projection_factor(gax, age_factor)
+            age_adjusted_gax = compute_age_adjusted_gax(gax, float(age), age_xg_curve, trend_factor)
+            age_adjusted_gax_per_60 = compute_age_adjusted_gax_per_60(gax_per_60, float(age), age_xg_curve, trend_factor)
          else:
             age_adjusted_gax_per_60 = gax_per_60
             age_adjusted_gax = gax
@@ -2297,8 +2181,9 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
          feature_spec = _build_feature_spec(training_rows)
 
          if use_player_features:
-            training_features, training_targets, scaler, feature_names, _, _, shooter_encoder, goalie_encoder = _vectorize_rows_with_entities(
+            training_features, training_targets, scaler, feature_names, _, _, shooter_encoder, goalie_encoder = _vectorize_rows(
                training_rows, feature_spec, fit_scaler=True,
+               shooter_encoder=LabelEncoder(), goalie_encoder=LabelEncoder(),
             )
          else:
             training_features, training_targets, scaler, feature_names = _vectorize_rows(training_rows, feature_spec, fit_scaler=True)
@@ -2488,7 +2373,7 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
             shooter_encoder.classes_ = np.array(shooter_classes)
          if goalie_classes:
             goalie_encoder.classes_ = np.array(goalie_classes)
-         scoring_features, _, _, _, _, _, _, _ = _vectorize_rows_with_entities(
+         scoring_features, _, _, _, _, _, _, _ = _vectorize_rows(
             scoring_rows, feature_spec, fit_scaler=False, scaler=scaler,
             shooter_encoder=shooter_encoder, goalie_encoder=goalie_encoder,
          )
@@ -2611,7 +2496,6 @@ def parse_args() -> argparse.Namespace:
    parser.add_argument("--no-player-effects", action="store_true", help="Disable shooter_id and goalie_id features (situation-only model).")
    parser.add_argument("--career-lookback", type=int, default=3, help="Number of trailing seasons for career trajectory tracking.")
    parser.add_argument("--rolling-window", type=int, default=3, help="Number of seasons for rolling benchmark metrics.")
-   parser.add_argument("--no-opponent-strength", action="store_true", help="Disable opponent strength features.")
    parser.add_argument("--no-rate-metrics", action="store_true", help="Disable rate-based metrics (per-60).")
    parser.add_argument("--no-age-adjusted", action="store_true", help="Disable age-adjusted career trajectory metrics.")
    parser.add_argument("--force", action="store_true", help="Skip staleness check; force re-score and replace all output tables for the target seasons.")
@@ -2644,7 +2528,6 @@ def main() -> None:
       use_player_effects=not args.no_player_effects,
       career_lookback_seasons=args.career_lookback,
       validation_split_strategy=args.validation_split_strategy,
-      include_opponent_strength=not args.no_opponent_strength,
       compute_rate_metrics=not args.no_rate_metrics,
       rolling_window_seasons=args.rolling_window,
       include_age_adjusted=not args.no_age_adjusted,

@@ -197,12 +197,27 @@ python Main.py --export-csv 2018NHLShotInfoV2.csv
 
 Advanced metrics are computed in a separate standalone script so the scrape path in `Main.py` stays unchanged.
 
-`Metrics.py` now trains and scores with a calibrated XGBoost xG model. It supports two model modes:
+`Metrics.py` trains and scores with a calibrated XGBoost xG model. It supports two model modes:
 
 - **Base situation model** — uses only shot-location and game-state features (league-average shooter vs. league-average goalie).
 - **Player-adaptive model** (default) — adds `shooter_id` and `goalie_id` as features so the model learns individual shooter finishing skill and goalie saving ability. This produces per-shot xG that reflects who took the shot and who was in net.
 
 It also writes validation and calibration-monitoring diagnostics into SQLite so you can track model quality over time, and computes career trajectory tables that track player and goalie performance across multiple seasons.
+
+### Age curve model
+
+The age-adjusted metrics (age-adjusted GAx) are computed by a separate module in [`age_model.py`](age_model.py). This module fits a smooth league-wide xG-per-game age curve using a 4th-degree polynomial with ridge regularization, blended with a prior lifecycle curve. It also computes player-specific trend multipliers from recent performance to adjust projections.
+
+The age model is independent from the core xG model and can be evolved or replaced separately.
+
+### Future: opponent strength features
+
+The `team_strength_metrics` table is created but currently stores placeholder data. A future enhancement will incorporate opponent team and goalie strength as features in the xG model. This would allow the model to account for:
+
+- **Team defense quality** — shots against stronger defensive teams are harder to score on
+- **Goalie quality** — facing a top-tier goalie reduces scoring probability beyond what the goalie_id feature captures
+
+To implement this, the feature spec in `_build_feature_spec()` would need additional numeric features for opponent metrics, and the `_vectorize_rows()` function would need to join against `team_strength_metrics` during vectorization.
 
 After scraping data into SQLite, run:
 
@@ -243,6 +258,9 @@ Useful options:
 - `--no-player-effects` (disables shooter_id/goalie_id features, falling back to situation-only model)
 - `--career-lookback` (default `3` trailing seasons for trajectory tracking)
 - `--validation-split-strategy` (default `random`, options: `random` or `temporal` — temporal splits by game date to avoid leakage)
+- `--rolling-window` (default `3` seasons for rolling benchmark metrics)
+- `--no-rate-metrics` (disables per-60 rate metrics)
+- `--no-age-adjusted` (disables age-adjusted metrics)
 
 Example with explicit model controls:
 
