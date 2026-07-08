@@ -44,7 +44,7 @@ class MetricsConfig:
    xgb_subsample: float = 0.9
    xgb_colsample_bytree: float = 0.9
    xgb_min_child_weight: float = 1.0
-   use_player_effects: bool = True
+   use_player_effects: bool = False
    career_lookback_seasons: int = 3
    # Options for enhanced metrics
    compute_rate_metrics: bool = True  # Compute per-60 rate metrics
@@ -298,6 +298,7 @@ def load_shots_for_prior_event_features(
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
+        AND zone = 'O'
       ORDER BY game_id, period, period_time
    """
    df = pd.read_sql_query(query, connection, params=seasons)
@@ -655,6 +656,7 @@ def _collect_source_fingerprint(connection: sqlite3.Connection, seasons: list[st
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
+        AND zone = 'O'
       GROUP BY season
       """,
       seasons,
@@ -785,6 +787,7 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
+        AND zone = 'O'
    """
    connection.row_factory = sqlite3.Row
    return list(connection.execute(query, seasons).fetchall())
@@ -806,12 +809,8 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
          "angle_squared",
          "distance_times_angle",
          "log_shot_distance",
-         "is_high_danger",
-         "is_slot",
          "trailing_by_two_plus",
          "leading_by_two_plus",
-         "is_power_play_for",
-         "is_short_handed",
          "seconds_since_last_event",
          "puck_velocity",
          "crossed_royal_road",
@@ -865,6 +864,25 @@ def _vectorize_rows(
          if math.isnan(angle):
             angle = angle_fallback
 
+      # Compute prior event features from raw data
+      # prev_event_seconds_ago is the time delta from the previous event
+      seconds_since_last_event = _safe_float(row["prev_event_seconds_ago"], 0.0)
+      
+      # Compute puck distance delta and velocity from coordinates
+      prev_x = _safe_float(row["prev_event_x"], None)
+      prev_y = _safe_float(row["prev_event_y"], None)
+      curr_x = _safe_float(row["x"])
+      curr_y = _safe_float(row["y"])
+      
+      if prev_x is not None and prev_y is not None:
+         distance_delta = math.sqrt((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2)
+         puck_velocity = distance_delta / seconds_since_last_event if seconds_since_last_event > 0 else 0.0
+         crossed_royal_road = (prev_y * curr_y) < 0  # crossed center line
+      else:
+         distance_delta = 0.0
+         puck_velocity = 0.0
+         crossed_royal_road = False
+
       numeric_values = [
          dist,
          angle,
@@ -874,15 +892,11 @@ def _vectorize_rows(
          angle * angle,
          dist * angle,
          math.log(max(dist, 1.0)),
-         1.0 if dist <= 20.0 and angle <= 45.0 else 0.0,
-         1.0 if dist <= 35.0 and angle <= 30.0 else 0.0,
          1.0 if _safe_float(row["score_differential"], 0.0) <= -2.0 else 0.0,
          1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
-         1.0 if str(row["strength_state"] or "").startswith("5v4") else 0.0,
-         1.0 if str(row["strength_state"] or "").startswith("4v5") else 0.0,
-         _safe_float(row["seconds_since_last_event"], 0.0),
-         _safe_float(row["puck_velocity"], 0.0),
-         1.0 if row["crossed_royal_road"] else 0.0,
+         seconds_since_last_event,
+         puck_velocity,
+         1.0 if crossed_royal_road else 0.0,
       ]
       numeric_matrix.append(numeric_values)
 
@@ -998,6 +1012,7 @@ def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
+        AND zone = 'O'
         AND shooter_id IS NOT NULL
         AND goalie_id IS NOT NULL
    """
@@ -1456,6 +1471,7 @@ def _compute_player_career_trajectory(
       JOIN shot_xg x ON x.event_hash = s.event_hash
       WHERE x.model_version = ?
         AND s.shooter_id IS NOT NULL
+        AND s.zone = 'O'
       GROUP BY s.shooter_id, s.season
    """, [model_version]).fetchall()
 
@@ -1791,6 +1807,7 @@ def _compute_player_season_advanced_metrics(
         AND shot_result IN ('Goal', 'ngshot')
         AND shooter_id IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
+        AND zone = 'O'
       GROUP BY shooter_id, season
    """, seasons).fetchall()
 
