@@ -398,5 +398,104 @@ class TestMainPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             Main.season_range(2022, 2021)
 
+    def test_parse_web_shot_events_uses_timeInPeriod_for_period_time(self):
+        """Test that period_time is extracted from timeInPeriod when periodTime is not in about."""
+        payload = {
+            "homeTeam": {"abbrev": "TOR"},
+            "awayTeam": {"abbrev": "MTL"},
+            "plays": [
+                {
+                    "typeDescKey": "shot-on-goal",
+                    "eventId": 101,
+                    "periodDescriptor": {"number": 1},
+                    "timeInPeriod": "05:30",
+                    "timeRemaining": "14:30",
+                    "details": {
+                        "xCoord": 20,
+                        "yCoord": 5,
+                        "shotType": "Wrist",
+                        "eventOwnerTeamTricode": "TOR",
+                        "shootingPlayerId": 11,
+                    },
+                },
+            ],
+        }
+
+        rows = Main.parse_web_shot_events(payload, "2023", 101)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Period_Time"], "05:30")
+        self.assertEqual(rows[0]["Period_Time_Remaining"], "14:30")
+
+    def test_backfill_player_names_returns_zero_when_no_players_table(self):
+        """Test that backfill returns (0, 0) when players table doesn't exist."""
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_backfill_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        # No players table exists
+        shooter_filled, goalie_filled = Main.backfill_player_names(db_path)
+        self.assertEqual(shooter_filled, 0)
+        self.assertEqual(goalie_filled, 0)
+
+    def test_backfill_player_names_fills_from_players_table(self):
+        """Test that backfill correctly fills shooter and goalie names from players table."""
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_backfill2_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        # Insert a row with shooter_id and goalie_id but no names
+        row = {
+            "Shot": "Goal",
+            "X": 20.0,
+            "Y": -3.0,
+            "Shot_Type": "Wrist Shot",
+            "Shooter": "Unknown",
+            "Shooter_ID": 101,
+            "Team": "TOR",
+            "Home_Away": 1,
+            "Period": 1,
+            "Year": "2023",
+            "GameID": 1,
+            "Goalie": None,
+            "Goalie_ID": 201,
+        }
+        Main.persist_rows(db_path, [row])
+
+        # Create players table and insert player records
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE players (player_id INTEGER PRIMARY KEY, full_name TEXT)")
+            cursor.execute("INSERT INTO players (player_id, full_name) VALUES (101, 'John Doe'), (201, 'Jane Smith')")
+            conn.commit()
+
+        # Run backfill
+        shooter_filled, goalie_filled = Main.backfill_player_names(db_path)
+        self.assertEqual(shooter_filled, 1)
+        self.assertEqual(goalie_filled, 1)
+
+        # Verify the names were filled
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT shooter, goalie FROM shots")
+            result = cursor.fetchone()
+            self.assertEqual(result[0], "John Doe")
+            self.assertEqual(result[1], "Jane Smith")
+
+    def test_check_players_table_warning_logs_warning_when_missing(self):
+        """Test that check_players_table_warning logs a warning when players table is missing."""
+        db_path = str(Path(tempfile.gettempdir()) / f"hockeyshotmap_warning_{uuid.uuid4().hex}.db")
+        Main.initialize_database(db_path)
+
+        # Should return True (warning logged) when players table doesn't exist
+        result = Main.check_players_table_warning(db_path)
+        self.assertTrue(result)
+
+        # Create players table
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE players (player_id INTEGER PRIMARY KEY, full_name TEXT)")
+            conn.commit()
+
+        # Should return False (no warning) when players table exists
+        result = Main.check_players_table_warning(db_path)
+        self.assertFalse(result)
+
 if __name__ == "__main__":
     unittest.main()

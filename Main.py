@@ -503,7 +503,8 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
          goalie = _normalize_text(_first_non_none(details.get("goalieInNetName"), details.get("goalieName")))
          goalie_id = _coerce_int(_first_non_none(details.get("goalieInNetId"), details.get("goalieId")))
          period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
-         period_time = _normalize_text(_first_non_none(about.get("periodTime"), play.get("periodTime")))
+         # period_time is at play level as timeInPeriod, not in about/periodTime
+         period_time = _normalize_text(_first_non_none(about.get("periodTime"), play.get("periodTime"), play.get("timeInPeriod")))
          period_time_remaining = _normalize_text(
             _first_non_none(
                about.get("periodTimeRemaining"),
@@ -1107,6 +1108,69 @@ def persist_rows(db_path: str, rows: list[dict]) -> int:
    return inserted
 
 
+def backfill_player_names(db_path: str) -> tuple[int, int]:
+   """Backfill shooter and goalie names from the players table using existing IDs.
+
+   This is a simple JOIN operation that updates rows where the name is NULL/Unknown
+   but the ID is populated. Returns (shooter_filled, goalie_filled) counts.
+
+   Requires the players table to exist (populated by player_bio.py).
+   """
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+
+      # Check if players table exists
+      cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='players'")
+      if cursor.fetchone() is None:
+         return 0, 0
+
+      # Backfill shooter names
+      cursor.execute("""
+         UPDATE shots
+         SET shooter = (
+            SELECT full_name FROM players WHERE players.player_id = shots.shooter_id
+         )
+         WHERE (shooter IS NULL OR shooter = '' OR shooter = 'Unknown')
+           AND shooter_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM players WHERE players.player_id = shots.shooter_id)
+      """)
+      shooter_filled = cursor.rowcount
+
+      # Backfill goalie names
+      cursor.execute("""
+         UPDATE shots
+         SET goalie = (
+            SELECT full_name FROM players WHERE players.player_id = shots.goalie_id
+         )
+         WHERE (goalie IS NULL OR goalie = '')
+           AND goalie_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM players WHERE players.player_id = shots.goalie_id)
+      """)
+      goalie_filled = cursor.rowcount
+
+      connection.commit()
+
+   return shooter_filled, goalie_filled
+
+
+def check_players_table_warning(db_path: str) -> bool:
+   """Check if players table exists and return True if it's missing.
+
+   Logs a warning if the players table doesn't exist, which would result in
+   'Unknown' shooter names and NULL goalie names.
+   """
+   with sqlite3.connect(db_path) as connection:
+      cursor = connection.cursor()
+      cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='players'")
+      if cursor.fetchone() is None:
+         logging.warning(
+            "Players table not found. Run 'python player_bio.py' to populate player names. "
+            "Shooter names will show as 'Unknown' and goalie names will be NULL."
+         )
+         return True
+   return False
+
+
 def capture_edge_summary_snapshots(db_path: str, season: str, game_type: str, timeout_seconds: int) -> int:
    # Store raw NHL Edge summary snapshots so downstream analysis can evolve without re-scraping.
    # These landing pages summarize team and player context such as top shot speed,
@@ -1554,6 +1618,9 @@ def run_season_scrape(config: ScrapeConfig, capture_edge: bool, capture_edge_dee
    configure_request_rate_limit(config.request_delay_seconds)
    active_sources = shot_sources_for_season(config.season)
 
+   # Warn if players table is missing (needed for shooter/goalie names)
+   check_players_table_warning(config.db_path)
+
    games_processed = 0
    rows_inserted = 0
    edge_payloads_inserted = 0
@@ -1672,6 +1739,16 @@ def run_season_scrape(config: ScrapeConfig, capture_edge: bool, capture_edge_dee
       config.season,
       player_stats_inserted,
    )
+
+   # Backfill shooter and goalie names from players table if it exists
+   shooter_filled, goalie_filled = backfill_player_names(config.db_path)
+   if shooter_filled > 0 or goalie_filled > 0:
+      logging.info(
+         "Season %s backfilled shooter_names=%s goalie_names=%s",
+         config.season,
+         shooter_filled,
+         goalie_filled,
+      )
 
    return games_processed, rows_inserted, edge_payloads_inserted, edge_detail_payloads_inserted, player_stats_inserted
 
