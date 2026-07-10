@@ -24,7 +24,7 @@ from urllib3.util.retry import Retry
 WEB_API_BASE_URL = "https://api-web.nhle.com/v1"
 
 # Player bio fetching defaults
-PLAYER_BIO_REQUEST_DELAY_SECONDS = 0.3  # Conservative delay to avoid NHL API rate limits
+PLAYER_BIO_REQUEST_DELAY_SECONDS = 0.2  # Conservative delay to avoid NHL API rate limits
 PLAYER_BIO_HTTP_RETRY_TOTAL = 5
 PLAYER_BIO_HTTP_RETRY_BACKOFF_FACTOR = 0.6
 PLAYER_BIO_HTTP_RATE_LIMIT_STATUSES = {500, 502, 503, 504}  # 429 handled by our own retry logic

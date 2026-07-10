@@ -1,15 +1,16 @@
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import math
-import hashlib
 import pickle
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -44,7 +45,7 @@ class MetricsConfig:
    xgb_subsample: float = 0.9
    xgb_colsample_bytree: float = 0.9
    xgb_min_child_weight: float = 1.0
-   use_player_effects: bool = False
+   use_player_effects: bool = True
    career_lookback_seasons: int = 3
    # Options for enhanced metrics
    compute_rate_metrics: bool = True  # Compute per-60 rate metrics
@@ -53,20 +54,11 @@ class MetricsConfig:
    force_refresh: bool = False  # Ignore staleness check; re-score and replace all target seasons
 
 
-FEATURE_SPEC_VERSION = "v3_xgb_player"
+FEATURE_SPEC_VERSION = "v5_xgb_prior_event_groups_no_zone"
 
 
 def _backfill_player_names(connection: sqlite3.Connection) -> dict[str, int]:
-   """Fill in missing shooter and goalie names in the shots table from the players table.
-
-   The shots table often has shooter_id/goalie_id populated but the corresponding
-   name columns (shooter, goalie) are NULL. This backfill resolves names from the
-   players table (populated by player_bio.py) so downstream metrics tables get
-   proper player names.
-
-   If the players table does not exist (e.g. player_bio.py has not been run yet),
-   this is a no-op.
-   """
+   """Fill missing shooter/goalie names in shots table from players table."""
    cursor = connection.cursor()
 
    # Check if the players table exists first
@@ -118,6 +110,54 @@ def _table_exists(executor: sqlite3.Connection | sqlite3.Cursor, table_name: str
    )
 
 
+def group_prior_event_types(df: "pd.DataFrame", column: str = "prev_event_type") -> "pd.DataFrame":
+   """Group raw prior_event_type strings into 4 tactical categories for XGBoost."""
+   # Define the mapping from raw event types to tactical categories
+   event_type_mapping = {
+      # Rebound situations
+      "shot-on-goal": "rebound",
+      "missed-shot": "rebound",
+      "blocked-shot": "rebound",
+      "failed-shot-attempt": "rebound",
+      # Rush situations
+      "takeaway": "rush",
+      "giveaway": "rush",
+      # Set play situations
+      "faceoff": "set_play",
+      "penalty": "set_play",
+      "stoppage": "set_play",
+      # Locational clash situations
+      "hit": "locational_clash",
+   }
+
+   # Create a copy to avoid modifying the original
+   result = df.copy()
+
+   normalized_event_type = result[column].fillna("").astype(str).str.strip().str.lower()
+   is_goal_prior_event = normalized_event_type == "goal"
+
+   # Map raw event types case-insensitively. Any unmapped value defaults to set_play,
+   # which is a conservative baseline where the goalie is presumed set.
+   result["prior_event_grouped"] = normalized_event_type.map(event_type_mapping).fillna("set_play")
+   result.loc[is_goal_prior_event, "prior_event_grouped"] = "set_play"
+
+   # Explicit goal override: reset continuous tracking metrics for those rows.
+   if "seconds_since_last_event" in result.columns:
+      result.loc[is_goal_prior_event, "seconds_since_last_event"] = 0
+   if "puck_velocity" in result.columns:
+      result.loc[is_goal_prior_event, "puck_velocity"] = 0
+   if "crossed_royal_road" in result.columns:
+      if pd.api.types.is_bool_dtype(result["crossed_royal_road"]):
+         result.loc[is_goal_prior_event, "crossed_royal_road"] = False
+      else:
+         result.loc[is_goal_prior_event, "crossed_royal_road"] = 0
+
+   # Convert to categorical dtype for XGBoost optimization
+   result["prior_event_grouped"] = result["prior_event_grouped"].astype("category")
+
+   return result
+
+
 def _load_player_seasonal_stats(
    connection: sqlite3.Connection,
    seasons: list[str],
@@ -151,45 +191,7 @@ def _load_player_seasonal_stats(
 
 
 def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
-   """Engineer continuous 'Prior Event' and 'Royal Road' features from NHL play-by-play data.
-
-   This function processes a sequentially ordered NHL play-by-play DataFrame and calculates
-   features for each shot-on-goal event based on the immediately preceding event.
-
-   Parameters
-   ----------
-   df : pd.DataFrame
-       NHL play-by-play DataFrame, sequentially ordered by game and time.
-       Required columns (as produced by Main.py):
-       - 'shot_result': event type ('Goal' or 'ngshot')
-       - 'period_time': time string in 'M:SS' format (e.g., '11:22')
-       - 'x': puck x-coordinate (ice width, typically -100 to 100)
-       - 'y': puck y-coordinate (ice length, typically -200 to 200)
-       - 'period': integer period number
-       - 'game_id': unique game identifier
-       - 'prev_event_type': categorical string of the previous play (from Main.py)
-       - 'prev_event_x': x-coordinate of previous event (from Main.py)
-       - 'prev_event_y': y-coordinate of previous event (from Main.py)
-       - 'prev_event_seconds_ago': seconds since previous event (from Main.py)
-
-   Returns
-   -------
-   pd.DataFrame
-       Input DataFrame with additional engineered columns:
-       - 'seconds_since_last_event': time delta in seconds from prior event
-       - 'prior_event_type': categorical string of previous play
-       - 'puck_distance_delta': Euclidean distance puck traveled from prior event
-       - 'puck_velocity': distance_delta / time_delta (0 if time_delta == 0)
-       - 'crossed_royal_road': boolean, True if puck crossed center line
-
-   Notes
-   -----
-   - Only rows where shot_result is 'Goal' or 'ngshot' get meaningful feature values.
-   - Rows where period or game_id differ from prior row get default values (0/null)
-     to prevent data leakage across intermissions or games.
-   - Uses vectorized pandas operations for performance.
-   """
-   import pandas as pd
+   """Engineer prior event features: seconds_since_last_event, prior_event_type, puck_distance_delta, puck_velocity, crossed_royal_road."""
 
    # Create a copy to avoid modifying the original
    result = df.copy()
@@ -208,9 +210,9 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    # Get prior event data from Main.py's already-computed columns
    # These columns are populated by Main.py's parse_web_shot_events function
    prior_event_type = result['prev_event_type'].shift(1)
-   prior_x = result['prev_event_x'].shift(1)
-   prior_y = result['prev_event_y'].shift(1)
-   prior_seconds_ago = result['prev_event_seconds_ago'].shift(1)
+   prior_x = pd.to_numeric(result['prev_event_x'], errors='coerce').shift(1)
+   prior_y = pd.to_numeric(result['prev_event_y'], errors='coerce').shift(1)
+   prior_seconds_ago = pd.to_numeric(result['prev_event_seconds_ago'], errors='coerce').shift(1)
 
    # Get current row's period and game_id for edge case safety
    prior_period = result['period'].shift(1)
@@ -220,14 +222,14 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    # This prevents data leakage across intermissions or games
    period_matches = (result['period'] == prior_period) & (result['game_id'] == prior_game_id)
 
+   curr_x = pd.to_numeric(result['x'], errors='coerce')
+   curr_y = pd.to_numeric(result['y'], errors='coerce')
+
    # Calculate Euclidean distance between puck positions
-   distance_delta = np.sqrt(
-       (result['x'] - prior_x) ** 2 +
-       (result['y'] - prior_y) ** 2
-   )
+   distance_delta = np.sqrt((curr_x - prior_x) ** 2 + (curr_y - prior_y) ** 2)
 
    # Royal road: crossed center line (y coordinates have different signs)
-   crossed_royal_road = (prior_y * result['y']) < 0
+   crossed_royal_road = (prior_y * curr_y) < 0
 
    # Apply edge case safety: only use computed values when period/game_id match
    # For non-matching rows, keep default values (0/null)
@@ -261,71 +263,16 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    return result
 
 
-def load_shots_for_prior_event_features(
-   connection: sqlite3.Connection,
-   seasons: list[str],
-) -> "pd.DataFrame":
-   """Load shots from database with all required columns for prior event feature engineering.
-
-   This function loads shot data from the database in the correct sequential order
-   (by game_id and period_time) for feature engineering.
-
-   Parameters
-   ----------
-   connection : sqlite3.Connection
-       Database connection to the hockey_data.db
-   seasons : list[str]
-       List of season strings to load (e.g., ['2023', '2024'])
-
-   Returns
-   -------
-   pd.DataFrame
-       DataFrame with shots ordered by game and time, ready for feature engineering.
-   """
-   import pandas as pd
-
-   placeholders = ",".join("?" for _ in seasons)
-   query = f"""
-      SELECT id, event_hash, season, game_id, shot_result, x, y,
-             period, period_time, period_time_remaining,
-             prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago,
-             shooter, shooter_id, team, home_away,
-             shot_type, shot_distance, shot_angle,
-             is_empty_net, strength_state, score_differential, zone, event_id
-      FROM shots
-      WHERE season IN ({placeholders})
-        AND shot_result IN ('Goal', 'ngshot')
-        AND x IS NOT NULL
-        AND y IS NOT NULL
-        AND COALESCE(is_empty_net, 0) = 0
-        AND zone = 'O'
-      ORDER BY game_id, period, period_time
-   """
-   df = pd.read_sql_query(query, connection, params=seasons)
-   return df
-
-
 def _temporal_split_indices(
    game_ids: np.ndarray,
    test_size: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-   """
-   Split indices temporally by game_id ordering.
-   NHL game_id format: season(4) + game_type(2) + game_number(4) = 10 digits.
-   Higher game_id = later in time.
-   """
+   """Split indices temporally by game_id ordering (higher game_id = later in time)."""
    if len(game_ids) == 0:
       return np.array([], dtype=int), np.array([], dtype=int)
-   
-   # Sort by game_id to get temporal order
    sorted_indices = np.argsort(game_ids)
-   split_point = int(len(sorted_indices) * (1.0 - test_size))
-   split_point = max(1, min(split_point, len(sorted_indices) - 1))
-   
-   train_indices = sorted_indices[:split_point]
-   valid_indices = sorted_indices[split_point:]
-   
-   return train_indices, valid_indices
+   split_point = max(1, min(int(len(sorted_indices) * (1.0 - test_size)), len(sorted_indices) - 1))
+   return sorted_indices[:split_point], sorted_indices[split_point:]
 
 
 def initialize_metrics_tables(db_path: str) -> None:
@@ -656,7 +603,6 @@ def _collect_source_fingerprint(connection: sqlite3.Connection, seasons: list[st
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
-        AND zone = 'O'
       GROUP BY season
       """,
       seasons,
@@ -703,6 +649,12 @@ def _lookup_cached_model(
    model_payload = json.loads(row["weights_json"])
    if not isinstance(model_payload, dict) or "model_blob_b64" not in model_payload:
       return None
+
+   # Check feature spec version to detect incompatible cached models
+   cached_version = feature_spec_payload.get("feature_spec_version")
+   if cached_version != FEATURE_SPEC_VERSION:
+      return None
+
    return str(row["model_version"]), feature_spec_payload, model_payload
 
 
@@ -766,6 +718,102 @@ def _derived_distance_and_angle(x_coord: float, y_coord: float) -> tuple[float, 
    return distance, angle
 
 
+def _calculate_angle_from_coords(x_coord: float, y_coord: float) -> float:
+   """Calculate the angle from a point on the ice to the goal at (89, 0).
+   
+   The angle is measured from the center of the goal (89, 0) to the shot location.
+   Uses the standard hockey rink coordinate system where x is width (-100 to 100)
+   and y is length (-200 to 200), with the goal at x=89.
+   
+   Parameters
+   ----------
+   x_coord : float
+       X-coordinate on the ice (width axis, -100 to 100)
+   y_coord : float
+       Y-coordinate on the ice (length axis, -200 to 200)
+   
+   Returns
+   -------
+   float
+       Angle in degrees from the goal center to the shot location
+   """
+   # Goal position is at (89, 0) - center of the goal
+   goal_x = 89.0
+   goal_y = 0.0
+   
+   # Calculate angle using atan2 relative to goal position
+   dx = x_coord - goal_x
+   dy = y_coord - goal_y
+   
+   # Angle in degrees, using absolute value for symmetry
+   angle = math.degrees(math.atan2(abs(dy), abs(dx)))
+   return angle
+
+
+def _calculate_change_in_angle(current_angle: float, prev_angle: float) -> float:
+   """Calculate the change in angle between current and previous event."""
+   return abs(current_angle - prev_angle)
+
+
+def _calculate_change_in_distance(current_distance: float, prev_distance: float) -> float:
+   """Calculate the change in distance between current and previous event."""
+   return current_distance - prev_distance
+
+
+def _calculate_net_openness(distance: float, angle: float) -> float:
+   """Calculate the visible size of the net from a given shot position.
+
+   Uses the law of cosines to calculate the angle subtended by the goal posts
+   from the shot location.
+
+   Parameters
+   ----------
+   distance : float
+       Distance from shot location to goal center (feet)
+   angle : float
+       Angle from goal center to shot location (degrees)
+
+   Returns
+   -------
+   float
+       Visible net angle in degrees (how much of the net is visible)
+   """
+   # NHL goal width is 6 feet
+   goal_width = 6.0
+
+   # Goal posts are at (89, -3) and (89, 3) - 3 feet from center
+   post_offset = 3.0
+
+   # Convert angle to radians for calculations
+   angle_rad = math.radians(angle)
+
+   if distance < 1.0:
+      # Too close to calculate meaningful net openness
+      return 90.0  # Maximum visibility
+
+   cos_a = math.cos(angle_rad)
+   sin_a = math.sin(angle_rad)
+
+   # Distance to left post (y = -3)
+   dist_to_left = math.sqrt((distance * cos_a) ** 2 + (distance * sin_a + post_offset) ** 2)
+   # Distance to right post (y = 3)
+   dist_to_right = math.sqrt((distance * cos_a) ** 2 + (distance * sin_a - post_offset) ** 2)
+
+   # Law of cosines: θ = arccos((a² + b² - c²) / (2ab))
+   a = dist_to_left
+   b = dist_to_right
+   c = goal_width
+
+   # Clamp the argument to avoid numerical issues
+   cos_theta = (a ** 2 + b ** 2 - c ** 2) / (2 * a * b)
+   cos_theta = max(-1.0, min(1.0, cos_theta))
+
+   net_openness_rad = math.acos(cos_theta)
+   net_openness_deg = math.degrees(net_openness_rad)
+
+   return net_openness_deg
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
    try:
       if value is None:
@@ -778,7 +826,7 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[str]) -> list[sqlite3.Row]:
    placeholders = ",".join("?" for _ in seasons)
    query = f"""
-      SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
+   SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state,
              score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
              prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
@@ -787,7 +835,6 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
-        AND zone = 'O'
    """
    connection.row_factory = sqlite3.Row
    return list(connection.execute(query, seasons).fetchall())
@@ -796,9 +843,13 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
 def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
    shot_types = sorted({(row["shot_type"] or "Unknown").strip() for row in rows})
    strength_states = sorted({(row["strength_state"] or "Unknown").strip() for row in rows})
-   zones = sorted({(row["zone"] or "Unknown").strip() for row in rows})
-   # Prior event types from play-by-play data
-   prior_event_types = sorted({(row["prev_event_type"] or "Unknown").strip() for row in rows if row["prev_event_type"]})
+
+   if rows:
+      prior_event_df = group_prior_event_types(pd.DataFrame([dict(row) for row in rows]))
+      prior_event_groups = sorted(set(prior_event_df["prior_event_grouped"].astype(str).tolist()))
+   else:
+      prior_event_groups = []
+
    return {
       "numeric": [
          "shot_distance",
@@ -812,13 +863,16 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
          "trailing_by_two_plus",
          "leading_by_two_plus",
          "seconds_since_last_event",
+         "puck_distance_delta",
          "puck_velocity",
          "crossed_royal_road",
+         "change_in_angle",
+         "change_in_distance",
+         "net_openness",
       ],
       "shot_type": shot_types,
       "strength_state": strength_states,
-      "zone": zones,
-      "prior_event_type": prior_event_types,
+      "prior_event_grouped": prior_event_groups,
    }
 
 
@@ -830,109 +884,117 @@ def _vectorize_rows(
    shooter_encoder: LabelEncoder | None = None,
    goalie_encoder: LabelEncoder | None = None,
 ) -> tuple:
-   """Vectorize shot rows into feature matrix and target vector.
-
-   When shooter_encoder and goalie_encoder are provided, also encodes
-   shooter_id and goalie_id as entity features for player-adaptive modeling.
-   Returns (features, targets, scaler, feature_names, [shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder]).
-   """
-   numeric_matrix: list[list[float]] = []
-   categorical_matrix: list[list[float]] = []
-   labels: list[float] = []
-
-   shot_type_to_idx = {value: idx for idx, value in enumerate(feature_spec["shot_type"])}
-   strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
-   zone_to_idx = {value: idx for idx, value in enumerate(feature_spec["zone"])}
-
-   cat_width = len(shot_type_to_idx) + len(strength_to_idx) + len(zone_to_idx) + len(feature_spec.get("prior_event_type", []))
-
+   """Vectorize shot rows into model features and targets."""
    use_entities = shooter_encoder is not None or goalie_encoder is not None
+   numeric_feature_names = list(feature_spec["numeric"])
+   categorical_feature_names = [
+      *(f"shot_type::{value}" for value in feature_spec["shot_type"]),
+      *(f"strength_state::{value}" for value in feature_spec["strength_state"]),
+      *(f"prior_event_grouped::{value}" for value in feature_spec.get("prior_event_grouped", [])),
+   ]
+   feature_names = [*numeric_feature_names, *categorical_feature_names]
+   if use_entities:
+      feature_names.extend(["shooter_id_encoded", "goalie_id_encoded"])
+
+   numeric_width = len(numeric_feature_names)
+   categorical_width = len(categorical_feature_names)
+   feature_width = numeric_width + categorical_width + (2 if use_entities else 0)
+
+   if not rows:
+      empty_features = np.empty((0, feature_width), dtype=np.float64)
+      empty_targets = np.empty((0,), dtype=np.float64)
+      if fit_scaler:
+         scaler = {"means": [0.0] * numeric_width, "stds": [1.0] * numeric_width}
+      elif scaler is None:
+         raise ValueError("scaler must be provided when fit_scaler is False")
+      if use_entities:
+         empty_entities = np.empty((0,), dtype=np.int64)
+         return empty_features, empty_targets, scaler, feature_names, empty_entities, empty_entities, shooter_encoder, goalie_encoder
+      return empty_features, empty_targets, scaler, feature_names
+
+   frame = pd.DataFrame([dict(row) for row in rows])
+   frame = engineer_prior_event_features(frame)
+   frame = group_prior_event_types(frame, "prior_event_type")
+
+   def _home_away_value(value: object) -> float:
+      text = str(value).strip().lower()
+      if text in {"home", "h", "1", "true"}:
+         return 1.0
+      if text in {"away", "a", "0", "false"}:
+         return 0.0
+      return _safe_float(value, 0.0)
+
+   numeric_rows: list[list[float]] = []
+   categorical_rows: list[list[float]] = []
+   labels: list[float] = []
    shooter_ids_raw: list[str] = []
    goalie_ids_raw: list[str] = []
 
-   # Build prior event type encoder
-   prior_event_types = feature_spec.get("prior_event_type", [])
-   prior_event_type_to_idx = {value: idx for idx, value in enumerate(prior_event_types)}
+   shot_type_to_idx = {value: idx for idx, value in enumerate(feature_spec["shot_type"])}
+   strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
+   prior_event_grouped_to_idx = {value: idx for idx, value in enumerate(feature_spec.get("prior_event_grouped", []))}
 
-   for row in rows:
-      dist = _safe_float(row["shot_distance"], default=float("nan"))
-      angle = _safe_float(row["shot_angle"], default=float("nan"))
+   for row in frame.itertuples(index=False):
+      dist = _safe_float(getattr(row, "shot_distance", None), default=float("nan"))
+      angle = _safe_float(getattr(row, "shot_angle", None), default=float("nan"))
+      curr_x = _safe_float(getattr(row, "x", None))
+      curr_y = _safe_float(getattr(row, "y", None))
       if math.isnan(dist) or math.isnan(angle):
-         dist_fallback, angle_fallback = _derived_distance_and_angle(_safe_float(row["x"]), _safe_float(row["y"]))
+         dist_fallback, angle_fallback = _derived_distance_and_angle(curr_x, curr_y)
          if math.isnan(dist):
             dist = dist_fallback
          if math.isnan(angle):
             angle = angle_fallback
 
-      # Compute prior event features from raw data
-      # prev_event_seconds_ago is the time delta from the previous event
-      seconds_since_last_event = _safe_float(row["prev_event_seconds_ago"], 0.0)
-      
-      # Compute puck distance delta and velocity from coordinates
-      prev_x = _safe_float(row["prev_event_x"], None)
-      prev_y = _safe_float(row["prev_event_y"], None)
-      curr_x = _safe_float(row["x"])
-      curr_y = _safe_float(row["y"])
-      
+      prev_x = _safe_float(getattr(row, "prev_event_x", None), None)
+      prev_y = _safe_float(getattr(row, "prev_event_y", None), None)
       if prev_x is not None and prev_y is not None:
-         distance_delta = math.sqrt((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2)
-         puck_velocity = distance_delta / seconds_since_last_event if seconds_since_last_event > 0 else 0.0
-         crossed_royal_road = (prev_y * curr_y) < 0  # crossed center line
+         prev_angle = _calculate_angle_from_coords(prev_x, prev_y)
+         prev_distance = math.hypot(89.0 - abs(prev_x), abs(prev_y))
       else:
-         distance_delta = 0.0
-         puck_velocity = 0.0
-         crossed_royal_road = False
+         prev_angle = 0.0
+         prev_distance = dist
 
-      numeric_values = [
+      seconds_since_last_event = _safe_float(getattr(row, "seconds_since_last_event", 0.0), 0.0)
+      puck_distance_delta = _safe_float(getattr(row, "puck_distance_delta", 0.0), 0.0)
+      puck_velocity = _safe_float(getattr(row, "puck_velocity", 0.0), 0.0)
+      crossed_royal_road = 1.0 if bool(getattr(row, "crossed_royal_road", False)) else 0.0
+      change_in_angle = _calculate_change_in_angle(angle, prev_angle)
+      change_in_distance = _calculate_change_in_distance(dist, prev_distance)
+      net_openness = _calculate_net_openness(dist, angle)
+      score_differential = _safe_float(getattr(row, "score_differential", 0.0), 0.0)
+
+      numeric_rows.append([
          dist,
          angle,
-         _safe_float(row["score_differential"], 0.0),
-         _safe_float(row["period"], 0.0),
-         _safe_float(row["home_away"], 0.0),
+         score_differential,
+         _safe_float(getattr(row, "period", 0.0), 0.0),
+         _home_away_value(getattr(row, "home_away", 0.0)),
          angle * angle,
          dist * angle,
-         math.log(max(dist, 1.0)),
-         1.0 if _safe_float(row["score_differential"], 0.0) <= -2.0 else 0.0,
-         1.0 if _safe_float(row["score_differential"], 0.0) >= 2.0 else 0.0,
+         math.log(max(dist, 1e-6)),
+         1.0 if score_differential <= -2.0 else 0.0,
+         1.0 if score_differential >= 2.0 else 0.0,
          seconds_since_last_event,
+         puck_distance_delta,
          puck_velocity,
-         1.0 if crossed_royal_road else 0.0,
-      ]
-      numeric_matrix.append(numeric_values)
+         crossed_royal_road,
+         change_in_angle,
+         change_in_distance,
+         net_openness,
+      ])
 
-      category_vec = [0.0] * cat_width
-      shot_type = (row["shot_type"] or "Unknown").strip()
-      strength = (row["strength_state"] or "Unknown").strip()
-      zone = (row["zone"] or "Unknown").strip()
-      prior_event = (row["prev_event_type"] or "Unknown").strip()
+      categorical_rows.append([
+         *[1.0 if str(getattr(row, "shot_type", "Unknown") or "Unknown").strip() == value else 0.0 for value in feature_spec["shot_type"]],
+         *[1.0 if str(getattr(row, "strength_state", "Unknown") or "Unknown").strip() == value else 0.0 for value in feature_spec["strength_state"]],
+         *[1.0 if str(getattr(row, "prior_event_grouped", "other") or "other").strip() == value else 0.0 for value in feature_spec.get("prior_event_grouped", [])],
+      ])
+      labels.append(1.0 if str(getattr(row, "shot_result", "")) == "Goal" else 0.0)
+      shooter_ids_raw.append(str(int(getattr(row, "shooter_id"))) if getattr(row, "shooter_id", None) is not None else "UNKNOWN")
+      goalie_ids_raw.append(str(int(getattr(row, "goalie_id"))) if getattr(row, "goalie_id", None) is not None else "UNKNOWN")
 
-      offset = 0
-      if shot_type in shot_type_to_idx:
-         category_vec[offset + shot_type_to_idx[shot_type]] = 1.0
-      offset += len(shot_type_to_idx)
-
-      if strength in strength_to_idx:
-         category_vec[offset + strength_to_idx[strength]] = 1.0
-      offset += len(strength_to_idx)
-
-      if zone in zone_to_idx:
-         category_vec[offset + zone_to_idx[zone]] = 1.0
-      offset += len(zone_to_idx)
-
-      if prior_event in prior_event_type_to_idx:
-         category_vec[offset + prior_event_type_to_idx[prior_event]] = 1.0
-
-      categorical_matrix.append(category_vec)
-      labels.append(1.0 if row["shot_result"] == "Goal" else 0.0)
-
-      if use_entities:
-         sid = row["shooter_id"]
-         gid = row["goalie_id"]
-         shooter_ids_raw.append(str(int(sid)) if sid is not None else "UNKNOWN")
-         goalie_ids_raw.append(str(int(gid)) if gid is not None else "UNKNOWN")
-
-   numeric_array = np.array(numeric_matrix, dtype=np.float64)
-   categorical_array = np.array(categorical_matrix, dtype=np.float64)
+   numeric_array = np.array(numeric_rows, dtype=np.float64)
+   categorical_array = np.array(categorical_rows, dtype=np.float64)
 
    if fit_scaler:
       means = numeric_array.mean(axis=0)
@@ -948,17 +1010,8 @@ def _vectorize_rows(
 
    features = np.concatenate([standardized_numeric, categorical_array], axis=1)
    targets = np.array(labels, dtype=np.float64)
-   feature_names = list(feature_spec["numeric"])
-   feature_names.extend([f"shot_type::{value}" for value in feature_spec["shot_type"]])
-   feature_names.extend([f"strength_state::{value}" for value in feature_spec["strength_state"]])
-   feature_names.extend([f"zone::{value}" for value in feature_spec["zone"]])
-   feature_names.extend([f"prior_event_type::{value}" for value in feature_spec.get("prior_event_type", [])])
 
    if use_entities:
-      feature_names.append("shooter_id_encoded")
-      feature_names.append("goalie_id_encoded")
-
-      # Build or reuse label encoders
       if fit_scaler or shooter_encoder is None or goalie_encoder is None:
          shooter_encoder, goalie_encoder, shooter_encoded, goalie_encoded = _build_entity_maps(rows)
       else:
@@ -973,7 +1026,6 @@ def _vectorize_rows(
 
       entity_column = np.column_stack([shooter_encoded.astype(np.float64), goalie_encoded.astype(np.float64)])
       features = np.concatenate([features, entity_column], axis=1)
-
       return features, targets, scaler, feature_names, shooter_encoded, goalie_encoded, shooter_encoder, goalie_encoder
 
    return features, targets, scaler, feature_names
@@ -1003,7 +1055,7 @@ def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[
    """Load shot rows including shooter_id and goalie_id for player-adaptive modeling."""
    placeholders = ",".join("?" for _ in seasons)
    query = f"""
-      SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state, zone,
+   SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state,
              score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
              shooter_id, goalie_id, prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
@@ -1708,7 +1760,6 @@ def _compute_team_strength_metrics(
    """, [model_version, *seasons]).fetchall()
 
    # Get goalie save percentages by team for the season
-   # Join shots with goalie info to get team-level goalie stats
    goalie_rows = cursor.execute(f"""
       SELECT s.team,
              COUNT(*) AS total_shots_against,
@@ -1765,29 +1816,11 @@ def _compute_player_season_advanced_metrics(
    rolling_window: int,
    include_age_adjusted: bool,
 ) -> int:
-   """Compute advanced rate-based metrics for players.
-
-   Fixes applied over the original placeholder implementation:
-
-   * **Games count** — Uses COUNT(DISTINCT game_id) from the shots table
-     per shooter per season instead of a shots/20 heuristic.
-   * **Age** — Resolved from the players table (birth_date) and computed
-     as age at the start of each season (October 1st).
-   * **Column indices** — Uses named column access (sqlite3.Row) so that
-     goals_above_expected is never confused with shooting_pct.
-   * **Rolling window** — Uses the corrected per-game rate for the trailing
-     N seasons, computed from the actual per-season aggregates.
-   * **age_adjusted_gax** — Raw-age-adjusted GAR column added alongside
-     the per-60 variant.
-   """
-   from datetime import date, datetime
+   """Compute advanced rate-based metrics for players."""
 
    saved_factory = connection.row_factory
    connection.row_factory = sqlite3.Row
 
-   # ------------------------------------------------------------------
-   # 1. Basic per-player-per-season aggregates from player_season_metrics
-   # ------------------------------------------------------------------
    player_rows = cursor.execute(f"""
       SELECT season, shooter, shooter_id, team, shots, goals, xg,
              goals_above_expected, shooting_pct, xg_per_shot
@@ -1797,9 +1830,6 @@ def _compute_player_season_advanced_metrics(
    """, [model_version, *seasons]).fetchall()
    season_stats = _load_player_seasonal_stats(connection, seasons)
 
-   # ------------------------------------------------------------------
-   # 2. Real game counts per shooter per season (distinct game_id)
-   # ------------------------------------------------------------------
    game_count_rows = cursor.execute(f"""
       SELECT shooter_id, season, COUNT(DISTINCT game_id) AS games_played
       FROM shots
@@ -1816,9 +1846,6 @@ def _compute_player_season_advanced_metrics(
       sid = int(row["shooter_id"])
       games_by_player.setdefault(sid, {})[str(row["season"])] = int(row["games_played"])
 
-   # ------------------------------------------------------------------
-   # 3. Player ages from players table (birth_date)
-   # ------------------------------------------------------------------
    player_birth: dict[int, date] = {}
    age_table_exists = cursor.execute(
       "SELECT name FROM sqlite_master WHERE type='table' AND name='players'"
@@ -1848,9 +1875,6 @@ def _compute_player_season_advanced_metrics(
          (season_start.month, season_start.day) < (birth.month, birth.day)
       )
 
-   # ------------------------------------------------------------------
-   # 4. Build player-season data dict (using named columns!)
-   # ------------------------------------------------------------------
    player_season_data: dict[int, dict[str, dict]] = {}
    for row in player_rows:
       sid = int(row["shooter_id"] or -1)
@@ -1864,7 +1888,6 @@ def _compute_player_season_advanced_metrics(
       games = int(stats["games_played"]) if stats else games_by_player.get(sid, {}).get(season, 0)
       shooting_pct = float(row["shooting_pct"] or 0.0)
       xg_per_shot = float(row["xg_per_shot"] or 0.0)
-      # Age at season start from birth date (fall back to 0 if unknown)
       birth = player_birth.get(sid)
       age = _age_at_season_start(birth, season) if birth else 0
       player_season_data.setdefault(sid, {})[season] = {
@@ -1884,9 +1907,6 @@ def _compute_player_season_advanced_metrics(
    all_seasons = sorted({s for sd in player_season_data.values() for s in sd})
    age_xg_curve = _build_age_xg_curve(player_season_data)
 
-   # ------------------------------------------------------------------
-   # 5. League averages per season (computed from every qualified player)
-   # ------------------------------------------------------------------
    league_avg: dict[str, dict[str, float]] = {}
    for season in seasons:
       season_players = [
@@ -1903,9 +1923,6 @@ def _compute_player_season_advanced_metrics(
          "shooting_pct": sum(d["goals"] for d in qualified) / sum(d["shots"] for d in qualified),
       }
 
-   # ------------------------------------------------------------------
-   # 6. Build insert rows
-   # ------------------------------------------------------------------
    insert_rows: list[tuple] = []
 
    for sid, season_map in player_season_data.items():
@@ -1925,16 +1942,13 @@ def _compute_player_season_advanced_metrics(
          games = data["games"]
          age = data["age"]
 
-         # -- Per-game rates (more robust than per-60 when TOI is absent) --
          toi = float(data["toi_minutes"])
 
          gax_per_60 = (gax / toi * 60.0) if toi > 0 else 0.0
          xg_per_60 = (xg / toi * 60.0) if toi > 0 else 0.0
          shooting_pct_per_60 = shooting_pct  # already a proportion
 
-         # -- League benchmarks --
          lavg = league_avg.get(season, {"gax_per_game": 0.0, "xg_per_game": 0.0, "shooting_pct": 0.0})
-         # Per-game league averages converted to per-60 for comparability
          league_avg_gax_per_60 = lavg["gax_per_game"] * 60.0 / 60.0  # = gax/game; same scale
          league_avg_xg_per_60 = lavg["xg_per_game"] * 60.0 / 60.0
          league_avg_shooting_pct = lavg["shooting_pct"]
@@ -1942,7 +1956,6 @@ def _compute_player_season_advanced_metrics(
          delta_gax_per_60 = gax_per_60 - league_avg_gax_per_60
          delta_shooting_pct = shooting_pct - league_avg_shooting_pct
 
-         # -- Rolling window (N previous seasons including current) --
          season_idx = all_seasons.index(season)
          rolling_seasons_list = all_seasons[max(0, season_idx - rolling_window + 1):season_idx + 1]
 
@@ -1958,7 +1971,6 @@ def _compute_player_season_advanced_metrics(
          rolling_gax_per_60 = (rolling_gax / (rolling_games * 60.0) * 60.0) if rolling_games > 0 else 0.0
          rolling_xg_per_60 = (rolling_xg / (rolling_games * 60.0) * 60.0) if rolling_games > 0 else 0.0
 
-         # -- Age-adjusted metrics (data-driven age curve + player trend) --
          if include_age_adjusted and age > 0:
             trend_factor = _player_trend_multiplier(season_map, season)
             age_adjusted_gax = compute_age_adjusted_gax(gax, float(age), age_xg_curve, trend_factor)
@@ -1995,9 +2007,6 @@ def _compute_player_season_advanced_metrics(
             age_adjusted_gax,
          ))
 
-   # ------------------------------------------------------------------
-   # 7. Persist
-   # ------------------------------------------------------------------
    if insert_rows:
       cursor.executemany(
          """
@@ -2025,7 +2034,6 @@ def _compute_player_career_advanced(
    seasons: list[str],
 ) -> int:
    """Compute career-level advanced metrics with trajectory analysis."""
-   from datetime import date, datetime
 
    saved_factory = connection.row_factory
    connection.row_factory = sqlite3.Row
@@ -2299,6 +2307,7 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
          model_payload = _serialize_model_payload(model, calibrator)
 
          feature_spec_payload = {
+            "feature_spec_version": FEATURE_SPEC_VERSION,
             "feature_spec": feature_spec,
             "scaler": scaler,
             "feature_names": feature_names,

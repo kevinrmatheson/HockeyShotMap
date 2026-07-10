@@ -4,6 +4,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+import pandas as pd
+
 import Main
 import Metrics
 
@@ -282,6 +284,64 @@ class TestMetricsPipeline(unittest.TestCase):
       self.assertEqual(second_summary["scored_seasons"], [])
       self.assertEqual(second_summary["skipped_seasons"], ["2024"])
       self.assertEqual(second_summary["scored_shots"], 0)
+
+
+class TestPriorEventGrouping(unittest.TestCase):
+   def test_group_prior_event_types_goal_override_resets_tracking_fields(self):
+      frame = pd.DataFrame(
+         {
+            "prior_event_type": ["Goal", "TaKeAwAy"],
+            "seconds_since_last_event": [12.5, 3.0],
+            "puck_velocity": [24.8, 11.2],
+            "crossed_royal_road": [True, True],
+         }
+      )
+
+      grouped = Metrics.group_prior_event_types(frame, "prior_event_type")
+
+      self.assertEqual(str(grouped.loc[0, "prior_event_grouped"]), "set_play")
+      self.assertEqual(grouped.loc[0, "seconds_since_last_event"], 0)
+      self.assertEqual(grouped.loc[0, "puck_velocity"], 0)
+      self.assertEqual(grouped.loc[0, "crossed_royal_road"], 0)
+      self.assertEqual(str(grouped.loc[1, "prior_event_grouped"]), "rush")
+
+   def test_group_prior_event_types_case_insensitive_and_safe_fallback(self):
+      frame = pd.DataFrame(
+         {
+            "prior_event_type": [
+               "SHOT-ON-GOAL",
+               "MiSsEd-ShOt",
+               "BLoCkEd-ShOt",
+               "FAILED-SHOT-ATTEMPT",
+               "gIvEaWaY",
+               "TAKEAWAY",
+               "Faceoff",
+               "PENALTY",
+               "Stoppage",
+               "HiT",
+               "Something-Unmapped",
+               None,
+            ]
+         }
+      )
+
+      grouped = Metrics.group_prior_event_types(frame, "prior_event_type")
+
+      expected = [
+         "rebound",
+         "rebound",
+         "rebound",
+         "rebound",
+         "rush",
+         "rush",
+         "set_play",
+         "set_play",
+         "set_play",
+         "locational_clash",
+         "set_play",
+         "set_play",
+      ]
+      self.assertEqual(grouped["prior_event_grouped"].astype(str).tolist(), expected)
 
 
 if __name__ == "__main__":
