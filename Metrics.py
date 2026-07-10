@@ -54,7 +54,166 @@ class MetricsConfig:
    force_refresh: bool = False  # Ignore staleness check; re-score and replace all target seasons
 
 
-FEATURE_SPEC_VERSION = "v5_xgb_prior_event_groups_no_zone"
+FEATURE_SPEC_VERSION = "v6_xgb_prior_event_groups_expanded"
+
+
+def classify_shot_strength(situation_code: int, event_team_side: str) -> str:
+   """
+   Classify shot strength from the shooter's perspective using NHL API situationCode.
+   
+   The situationCode is a 4-digit number where each digit represents:
+   - Digit 0 (AwayGoalie): 0 = pulled, 1 = in net
+   - Digit 1 (AwaySkaters): number of away team skaters on ice
+   - Digit 2 (HomeSkaters): number of home team skaters on ice
+   - Digit 3 (HomeGoalie): 0 = pulled, 1 = in net
+   
+   Parameters
+   ----------
+   situation_code : int
+       4-digit NHL API situation code (e.g., 1551 for 5v5, 1560 for 6v5 EN)
+   event_team_side : str
+       'Home' or 'Away' - which team took the shot
+   
+   Returns
+   -------
+   str
+       One of: '5v5', 'Even_Opened', 'PP_1', 'PP_2', 'PK_1', 'PK_2', 'EN_For', 'EN_Against', 'Other'
+   
+   Notes
+   -----
+   Classification is from the shooter's perspective:
+   - EN_For: Shooter's goalie is pulled (extra attacker for shooter's team)
+   - EN_Against: Shooting at an open net (opponent's goalie is pulled)
+   """
+   # Validate inputs
+   if event_team_side not in ('Home', 'Away'):
+      raise ValueError(f"event_team_side must be 'Home' or 'Away', got: {event_team_side}")
+   
+   # Convert to string and pad with leading zeros if needed
+   code_str = f"{situation_code:04d}"
+   
+   # Extract digits: AwayGoalie, AwaySkaters, HomeSkaters, HomeGoalie
+   away_goalie = int(code_str[0])
+   away_skaters = int(code_str[1])
+   home_skaters = int(code_str[2])
+   home_goalie = int(code_str[3])
+   
+   # Determine shooter's and opponent's values based on team side
+   if event_team_side == 'Home':
+      shooter_goalie = home_goalie
+      shooter_skaters = home_skaters
+      opp_goalie = away_goalie
+      opp_skaters = away_skaters
+   else:  # Away
+      shooter_goalie = away_goalie
+      shooter_skaters = away_skaters
+      opp_goalie = home_goalie
+      opp_skaters = home_skaters
+   
+   # Calculate skater advantage from shooter's perspective
+   skater_diff = shooter_skaters - opp_skaters
+   
+   # Check for empty net situations first (goalie pulled = 0)
+   if shooter_goalie == 0 and opp_goalie == 1:
+      # Shooter's goalie pulled, opponent's goalie in net
+      return 'EN_For'
+   elif shooter_goalie == 1 and opp_goalie == 0:
+      # Shooter's goalie in net, opponent's goalie pulled
+      return 'EN_Against'
+   elif shooter_goalie == 0 and opp_goalie == 0:
+      # Both goalies pulled - unusual but possible in late-game situations
+      return 'Other'
+   
+   # Both goalies in net - classify by skater advantage
+   if shooter_skaters == opp_skaters:
+      if shooter_skaters == 5:
+         return '5v5'
+      else:
+         # Equal but less than 5 (4v4, 3v3, etc.)
+         return 'Even_Opened'
+   elif skater_diff == 1:
+      return 'PP_1'
+   elif skater_diff == 2:
+      return 'PP_2'
+   elif skater_diff == -1:
+      return 'PK_1'
+   elif skater_diff == -2:
+      return 'PK_2'
+   else:
+      # Any other mismatch (3v5, 4v6, etc.)
+      return 'Other'
+
+
+# Test cases for the classify_shot_strength function
+def _test_classify_shot_strength():
+   """Test the classify_shot_strength function with various edge cases."""
+   # 5v5 - both goalies in net, 5 skaters each
+   # 1551: AwayGoalie=1, AwaySkaters=5, HomeSkaters=5, HomeGoalie=1
+   assert classify_shot_strength(1551, 'Home') == '5v5'
+   assert classify_shot_strength(1551, 'Away') == '5v5'
+   
+   # 4v4 - both goalies in net, equal but less than 5
+   # 1441: AwayGoalie=1, AwaySkaters=4, HomeSkaters=4, HomeGoalie=1
+   assert classify_shot_strength(1441, 'Home') == 'Even_Opened'
+   assert classify_shot_strength(1441, 'Away') == 'Even_Opened'
+   
+   # PP_1 - shooter has +1 advantage, both goalies in net
+   # 1551 is 5v5, need 5v4: AwayGoalie=1, AwaySkaters=4, HomeSkaters=5, HomeGoalie=1
+   # Code: 1451 (Away 4v5 Home)
+   # When Home shoots: Home=5, Away=4, diff=+1 -> PP_1
+   assert classify_shot_strength(1451, 'Home') == 'PP_1'  # Home 5v4
+   # When Away shoots: Away=4, Home=5, diff=-1 -> PK_1
+   assert classify_shot_strength(1451, 'Away') == 'PK_1'  # Away 4v5
+   
+   # PP_2 - shooter has +2 advantage
+   # 6v4: AwayGoalie=1, AwaySkaters=4, HomeSkaters=6, HomeGoalie=1 -> Code: 1461
+   assert classify_shot_strength(1461, 'Home') == 'PP_2'  # Home 6v4
+   assert classify_shot_strength(1461, 'Away') == 'PK_2'  # Away 4v6
+   
+   # PK_1 - shooter has -1 disadvantage (already covered above)
+   # 4v5: AwayGoalie=1, AwaySkaters=5, HomeSkaters=4, HomeGoalie=1 -> Code: 1541
+   assert classify_shot_strength(1541, 'Home') == 'PK_1'  # Home 4v5
+   assert classify_shot_strength(1541, 'Away') == 'PP_1'  # Away 5v4
+   
+   # PK_2 - shooter has -2 disadvantage
+   # 3v5: AwayGoalie=1, AwaySkaters=5, HomeSkaters=3, HomeGoalie=1 -> Code: 1531
+   assert classify_shot_strength(1531, 'Home') == 'PK_2'  # Home 3v5
+   assert classify_shot_strength(1531, 'Away') == 'PP_2'  # Away 5v3
+   
+   # EN_For - shooter's goalie pulled (extra attacker)
+   # 1560: AwayGoalie=1, AwaySkaters=5, HomeSkaters=6, HomeGoalie=0
+   # When Home shoots: Home goalie=0 (pulled), Away goalie=1 -> EN_For
+   # When Away shoots: Away goalie=1, Home goalie=0 -> EN_Against
+   assert classify_shot_strength(1560, 'Home') == 'EN_For'  # Home has extra attacker
+   assert classify_shot_strength(1560, 'Away') == 'EN_Against'  # Away shoots at open net
+   
+   # EN_Against - opponent's goalie pulled (shooting at open net)
+   # 0651: AwayGoalie=0, AwaySkaters=6, HomeSkaters=5, HomeGoalie=1
+   # When Home shoots: Home goalie=1, Away goalie=0 -> EN_Against
+   # When Away shoots: Away goalie=0, Home goalie=1 -> EN_For
+   assert classify_shot_strength(651, 'Home') == 'EN_Against'  # Home shoots at open net
+   assert classify_shot_strength(651, 'Away') == 'EN_For'  # Away has extra attacker
+   
+   # Other - both goalies pulled
+   assert classify_shot_strength(0, 'Home') == 'Other'
+   assert classify_shot_strength(0, 'Away') == 'Other'
+   
+   # Other - unusual mismatches (7v5, etc.)
+   # 1751: AwayGoalie=1, AwaySkaters=5, HomeSkaters=7, HomeGoalie=1 -> 5v7
+   # Home has -2 advantage, Away has +2
+   assert classify_shot_strength(1751, 'Home') == 'PK_2'  # Home 5v7
+   assert classify_shot_strength(1751, 'Away') == 'PP_2'  # Away 7v5
+   
+   # Test a truly unusual case: 8v5 (3+ advantage)
+   # 1851: AwayGoalie=1, AwaySkaters=5, HomeSkaters=8, HomeGoalie=1 -> 5v8
+   assert classify_shot_strength(1851, 'Home') == 'Other'  # 5v8 is very unusual
+   
+   print("All test cases passed!")
+
+
+# Run tests when module is executed directly
+if __name__ == "__main__":
+   _test_classify_shot_strength()
 
 
 def _backfill_player_names(connection: sqlite3.Connection) -> dict[str, int]:
@@ -111,22 +270,31 @@ def _table_exists(executor: sqlite3.Connection | sqlite3.Cursor, table_name: str
 
 
 def group_prior_event_types(df: "pd.DataFrame", column: str = "prev_event_type") -> "pd.DataFrame":
-   """Group raw prior_event_type strings into 4 tactical categories for XGBoost."""
+   """Group raw prior_event_type strings into tactical categories for XGBoost."""
    # Define the mapping from raw event types to tactical categories
+   # NHL API typeDescKey values mapped to tactical situations
    event_type_mapping = {
-      # Rebound situations
+      # Rebound situations - shot attempts that didn't score
       "shot-on-goal": "rebound",
       "missed-shot": "rebound",
       "blocked-shot": "rebound",
       "failed-shot-attempt": "rebound",
-      # Rush situations
+      # Rush situations - transition plays, puck movement, chaotic changes
       "takeaway": "rush",
       "giveaway": "rush",
-      # Set play situations
+      "puck-bounce": "rush",  # Puck bouncing off boards/rim creates chaotic transition
+      # Set play situations - structured, stationary plays
       "faceoff": "set_play",
       "penalty": "set_play",
       "stoppage": "set_play",
-      # Locational clash situations
+      "play-stoppage": "set_play",  # Explicit play stoppage
+      "period-start": "set_play",  # Period start/reset
+      "period-end": "set_play",  # Period end/reset
+      "coach-challenge": "set_play",  # Review stoppage
+      "referee-emergency": "set_play",  # Official emergency
+      "line-umpire": "set_play",  # Official line change
+      "official-throw": "set_play",  # Official throw of puck
+      # Locational clash situations - physical contact
       "hit": "locational_clash",
    }
 
@@ -203,24 +371,17 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    result['puck_velocity'] = 0.0
    result['crossed_royal_road'] = False
 
-   # Identify shot-on-goal/goal rows (events that are shots)
-   # Main.py uses 'shot_result' values: 'Goal' or 'ngshot'
-   is_shot = result['shot_result'].isin(['Goal', 'ngshot'])
-
    # Get prior event data from Main.py's already-computed columns
    # These columns are populated by Main.py's parse_web_shot_events function
-   prior_event_type = result['prev_event_type'].shift(1)
-   prior_x = pd.to_numeric(result['prev_event_x'], errors='coerce').shift(1)
-   prior_y = pd.to_numeric(result['prev_event_y'], errors='coerce').shift(1)
-   prior_seconds_ago = pd.to_numeric(result['prev_event_seconds_ago'], errors='coerce').shift(1)
+   # Each row already contains the previous event's info directly
+   prior_event_type = result['prev_event_type']
+   prior_x = pd.to_numeric(result['prev_event_x'], errors='coerce')
+   prior_y = pd.to_numeric(result['prev_event_y'], errors='coerce')
+   prior_seconds_ago = pd.to_numeric(result['prev_event_seconds_ago'], errors='coerce')
 
-   # Get current row's period and game_id for edge case safety
-   prior_period = result['period'].shift(1)
-   prior_game_id = result['game_id'].shift(1)
-
-   # Check if period and game_id match (edge case safety)
-   # This prevents data leakage across intermissions or games
-   period_matches = (result['period'] == prior_period) & (result['game_id'] == prior_game_id)
+   # Check if prior event data exists (not null) for edge case safety
+   # This prevents using invalid data when there's no prior event
+   has_prior_event = prior_x.notna() & prior_y.notna() & (prior_seconds_ago > 0)
 
    curr_x = pd.to_numeric(result['x'], errors='coerce')
    curr_y = pd.to_numeric(result['y'], errors='coerce')
@@ -231,34 +392,34 @@ def engineer_prior_event_features(df: "pd.DataFrame") -> "pd.DataFrame":
    # Royal road: crossed center line (y coordinates have different signs)
    crossed_royal_road = (prior_y * curr_y) < 0
 
-   # Apply edge case safety: only use computed values when period/game_id match
-   # For non-matching rows, keep default values (0/null)
+   # Apply edge case safety: only use computed values when prior event data exists
+   # For rows without prior event data, keep default values (0/null)
    result['seconds_since_last_event'] = np.where(
-       period_matches,
+       has_prior_event,
        prior_seconds_ago,
        0.0
    )
 
    result['prior_event_type'] = np.where(
-       period_matches,
+       has_prior_event,
        prior_event_type,
        None
    )
 
    result['puck_distance_delta'] = np.where(
-       period_matches,
+       has_prior_event,
        distance_delta,
        0.0
    )
 
    # Calculate velocity (avoid division by zero)
    result['puck_velocity'] = np.where(
-       (period_matches) & (prior_seconds_ago > 0),
+       has_prior_event,
        distance_delta / prior_seconds_ago,
        0.0
    )
 
-   result['crossed_royal_road'] = period_matches & crossed_royal_road
+   result['crossed_royal_road'] = has_prior_event & crossed_royal_road
 
    return result
 
@@ -2230,7 +2391,7 @@ def run_metrics_refresh(config: MetricsConfig) -> dict:
       config_signature = _config_signature(config, train_seasons)
       train_signature = _train_signature(train_fingerprint)
 
-      cached_model = _lookup_cached_model(connection, config_signature, train_signature)
+      cached_model = None if config.force_refresh else _lookup_cached_model(connection, config_signature, train_signature)
       trained_new_model = False
       feature_importance: dict[str, object] = {"ranked": [], "near_zero": []}
       validation_metrics: dict[str, float] | None = None

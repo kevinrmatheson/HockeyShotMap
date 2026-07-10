@@ -485,6 +485,23 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
             if current_seconds_remaining is not None and isinstance(previous_seconds_remaining, int):
                prev_event_seconds_ago = abs(previous_seconds_remaining - current_seconds_remaining)
 
+         # Safety case: if prior event is from a different period or game,
+         # default to a set play at center ice (0, 0)
+         if prev_event_seconds_ago is None:
+            prev_event_type = "set_play"
+            prev_event_x = 0.0
+            prev_event_y = 0.0
+            prev_event_seconds_ago = 0
+         elif last_coord_event is not None:
+            # Check if prior event is from a different period or game
+            prev_period = last_coord_event.get("period")
+            prev_game_id = last_coord_event.get("game_id")
+            if prev_period != period or prev_game_id != game_id:
+               prev_event_type = "set_play"
+               prev_event_x = 0.0
+               prev_event_y = 0.0
+               prev_event_seconds_ago = 0
+
          owner_team_id = details.get("eventOwnerTeamId")
          try:
             owner_team_id = int(owner_team_id) if owner_team_id is not None else None
@@ -581,6 +598,8 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
                _period_time_to_seconds(about.get("periodTimeRemaining")),
                _period_time_to_seconds(play.get("timeRemaining")),
             ),
+            "period": period,
+            "game_id": game_id,
          }
 
    return rows
@@ -651,10 +670,11 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
             "Score_Differential": score_differential,
             "Zone": zone,
             "Event_ID": event_id,
-            "Prev_Event_Type": None,
-            "Prev_Event_X": None,
-            "Prev_Event_Y": None,
-            "Prev_Event_Seconds_Ago": None,
+            # Stats API doesn't provide prior event info; default to set play at center ice
+            "Prev_Event_Type": "set_play",
+            "Prev_Event_X": 0.0,
+            "Prev_Event_Y": 0.0,
+            "Prev_Event_Seconds_Ago": 0,
          }
       )
 
