@@ -13,7 +13,6 @@ class HeatmapFilters:
    season: str | None = None
    team: str | None = None
    player: str | None = None
-   strength_state: str | None = None
    shot_result: str | None = None
    home_away: int | None = None
    period: int | None = None
@@ -45,9 +44,6 @@ def _build_where(filters: HeatmapFilters) -> tuple[str, list[Any]]:
    if filters.player:
       clauses.append("shooter = ?")
       params.append(filters.player)
-   if filters.strength_state:
-      clauses.append("strength_state = ?")
-      params.append(filters.strength_state)
    if filters.home_away is not None:
       clauses.append("home_away = ?")
       params.append(filters.home_away)
@@ -82,9 +78,6 @@ def get_filter_options(db_path: str) -> dict[str, list[str]]:
       player_rows = connection.execute(
          "SELECT DISTINCT shooter FROM shots WHERE shooter IS NOT NULL AND shooter != '' ORDER BY shooter"
       ).fetchall()
-      strength_rows = connection.execute(
-         "SELECT DISTINCT strength_state FROM shots WHERE strength_state IS NOT NULL AND strength_state != '' ORDER BY strength_state"
-      ).fetchall()
       period_rows = connection.execute(
          "SELECT DISTINCT period FROM shots WHERE period IS NOT NULL ORDER BY period"
       ).fetchall()
@@ -93,7 +86,6 @@ def get_filter_options(db_path: str) -> dict[str, list[str]]:
       "seasons": [row["season"] for row in season_rows if row["season"]],
       "teams": [row["team"] for row in team_rows if row["team"]],
       "players": [row["shooter"] for row in player_rows if row["shooter"]],
-      "strength_states": [row["strength_state"] for row in strength_rows if row["strength_state"]],
       "periods": [str(row["period"]) for row in period_rows if row["period"] is not None],
       "shot_results": ["all", "Goal", "ngshot"],
       "home_away": ["all", "home", "away"],
@@ -187,7 +179,6 @@ def build_filters_from_args(args: dict[str, str]) -> HeatmapFilters:
       season=_clean_text(args.get("season")),
       team=_clean_text(args.get("team")),
       player=_clean_text(args.get("player")),
-      strength_state=_clean_text(args.get("strength_state")),
       shot_result=_clean_text(args.get("shot_result")),
       home_away=home_away_value,
       period=period_value,

@@ -136,7 +136,6 @@ class TestMainPipeline(unittest.TestCase):
         self.assertEqual(rows[0]["Shooter_ID"], 11)
         self.assertEqual(rows[0]["Goalie"], "Goalie X")
         self.assertEqual(rows[0]["Period_Time"], "12:34")
-        self.assertEqual(rows[0]["Strength_State"], "5v5")
         self.assertEqual(rows[0]["Event_ID"], 101)
         self.assertEqual(rows[1]["Shot"], "ngshot")
         self.assertEqual(rows[1]["Home_Away"], 0)

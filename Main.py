@@ -537,10 +537,15 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
                shot_distance = derived_distance
             if shot_angle is None:
                shot_angle = derived_angle
-         is_empty_net = _coerce_bool_int(_first_non_none(details.get("emptyNet"), details.get("isEmptyNet"), details.get("empty_net")))
-         if is_empty_net is None and goalie_id is None:
-            is_empty_net = 1 if event_key == "goal" else None
-         strength_state = _normalize_text(_first_non_none(details.get("strength"), details.get("situationCode"), play.get("situationCode")))
+         # is_empty_net: 1 if empty net, 0 if not empty, None if unknown
+         is_empty_net_raw = _coerce_bool_int(_first_non_none(details.get("emptyNet"), details.get("isEmptyNet"), details.get("empty_net")))
+         if is_empty_net_raw is None:
+            # Fallback: if no goalie and it's a goal, assume empty net
+            is_empty_net = 1 if event_key == "goal" and goalie_id is None else 0
+         else:
+            is_empty_net = is_empty_net_raw
+         # Store raw situationCode for shot strength classification
+         situation_code = _coerce_int(_first_non_none(details.get("situationCode"), play.get("situationCode")))
          score_differential = _coerce_int(_first_non_none(details.get("scoreDifferential"), details.get("goalDifferential"), play.get("scoreDifferential")))
          if score_differential is None and isinstance(team_code, str):
             if _home_away_value(team_code, home_code, away_code) == 1:
@@ -571,7 +576,7 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
                "Shot_Distance": shot_distance,
                "Shot_Angle": shot_angle,
                "Is_Empty_Net": is_empty_net,
-               "Strength_State": strength_state,
+               "Situation_Code": situation_code,
                "Score_Differential": score_differential,
                "Zone": zone,
                "Event_ID": event_id,
@@ -636,8 +641,10 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
       # Extract additional fields from stats API
       shot_distance = _coerce_float(record.get("shotDistance") or record.get("distance"))
       shot_angle = _coerce_float(record.get("shotAngle") or record.get("angle"))
-      is_empty_net = _coerce_bool_int(record.get("emptyNet") or record.get("isEmptyNet"))
-      strength_state = _normalize_text(record.get("strength") or record.get("situationCode"))
+      # is_empty_net: 1 if empty net, 0 if not empty, None if unknown
+      is_empty_net_raw = _coerce_bool_int(record.get("emptyNet") or record.get("isEmptyNet"))
+      is_empty_net = is_empty_net_raw if is_empty_net_raw is not None else 0
+      situation_code = _coerce_int(record.get("situationCode"))
       score_differential = _coerce_int(record.get("scoreDifferential") or record.get("goalDifferential"))
       zone = _normalize_text(record.get("zone") or record.get("zoneCode"))
       event_id = _coerce_int(record.get("eventId"))
@@ -666,7 +673,7 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
             "Shot_Distance": shot_distance,
             "Shot_Angle": shot_angle,
             "Is_Empty_Net": is_empty_net,
-            "Strength_State": strength_state,
+            "Situation_Code": situation_code,
             "Score_Differential": score_differential,
             "Zone": zone,
             "Event_ID": event_id,
@@ -709,7 +716,7 @@ def initialize_database(db_path: str) -> None:
             shot_distance REAL,
             shot_angle REAL,
             is_empty_net INTEGER,
-            strength_state TEXT,
+            situation_code INTEGER,
             score_differential INTEGER,
             zone TEXT,
             event_id INTEGER,
@@ -743,8 +750,6 @@ def initialize_database(db_path: str) -> None:
          cursor.execute("ALTER TABLE shots ADD COLUMN shot_angle REAL")
       if "is_empty_net" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN is_empty_net INTEGER")
-      if "strength_state" not in columns:
-         cursor.execute("ALTER TABLE shots ADD COLUMN strength_state TEXT")
       if "score_differential" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN score_differential INTEGER")
       if "zone" not in columns:
@@ -759,12 +764,13 @@ def initialize_database(db_path: str) -> None:
          cursor.execute("ALTER TABLE shots ADD COLUMN prev_event_y REAL")
       if "prev_event_seconds_ago" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN prev_event_seconds_ago INTEGER")
+      if "situation_code" not in columns:
+         cursor.execute("ALTER TABLE shots ADD COLUMN situation_code INTEGER")
 
       cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_shots_event_hash ON shots(event_hash)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_season ON shots(season)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_team ON shots(team)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_shooter ON shots(shooter)")
-      cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_strength_state ON shots(strength_state)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_shot_result ON shots(shot_result)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_period ON shots(period)")
       cursor.execute("CREATE INDEX IF NOT EXISTS idx_shots_home_away ON shots(home_away)")
@@ -1040,7 +1046,7 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          row.get("Shot_Distance"),
          row.get("Shot_Angle"),
          row.get("Is_Empty_Net"),
-         row.get("Strength_State"),
+         row.get("Situation_Code"),
          row.get("Score_Differential"),
          row.get("Zone"),
          row.get("Event_ID"),
@@ -1058,10 +1064,10 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
       INSERT INTO shots (
          event_hash, shot_result, x, y, shot_type, shooter, shooter_id, team,
          home_away, period, period_time, period_time_remaining, season, game_id, api_source,
-         goalie, goalie_id, shot_distance, shot_angle, is_empty_net, strength_state,
-         score_differential, zone, event_id, prev_event_type, prev_event_x, prev_event_y,
+         goalie, goalie_id, shot_distance, shot_angle, is_empty_net,
+         situation_code, score_differential, zone, event_id, prev_event_type, prev_event_x, prev_event_y,
          prev_event_seconds_ago
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_hash) DO UPDATE SET
          shot_result = excluded.shot_result,
          x = excluded.x,
@@ -1082,7 +1088,7 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          shot_distance = COALESCE(excluded.shot_distance, shots.shot_distance),
          shot_angle = COALESCE(excluded.shot_angle, shots.shot_angle),
          is_empty_net = COALESCE(excluded.is_empty_net, shots.is_empty_net),
-         strength_state = COALESCE(excluded.strength_state, shots.strength_state),
+         situation_code = COALESCE(excluded.situation_code, shots.situation_code),
          score_differential = COALESCE(excluded.score_differential, shots.score_differential),
          zone = COALESCE(excluded.zone, shots.zone),
          event_id = COALESCE(excluded.event_id, shots.event_id),
@@ -1102,7 +1108,7 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          OR COALESCE(excluded.shot_distance, shots.shot_distance) IS NOT shots.shot_distance
          OR COALESCE(excluded.shot_angle, shots.shot_angle) IS NOT shots.shot_angle
          OR COALESCE(excluded.is_empty_net, shots.is_empty_net) IS NOT shots.is_empty_net
-         OR COALESCE(excluded.strength_state, shots.strength_state) IS NOT shots.strength_state
+         OR COALESCE(excluded.situation_code, shots.situation_code) IS NOT shots.situation_code
          OR COALESCE(excluded.score_differential, shots.score_differential) IS NOT shots.score_differential
          OR COALESCE(excluded.zone, shots.zone) IS NOT shots.zone
          OR COALESCE(excluded.event_id, shots.event_id) IS NOT shots.event_id

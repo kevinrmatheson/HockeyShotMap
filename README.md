@@ -423,7 +423,6 @@ Export fields are preserved in this order:
 - `Shot_Distance`
 - `Shot_Angle`
 - `Is_Empty_Net`
-- `Strength_State`
 - `Score_Differential`
 - `Zone`
 - `Event_ID`

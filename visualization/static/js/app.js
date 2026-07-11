@@ -9,7 +9,6 @@ const controls = {
    team: document.getElementById("team-filter"),
    player: document.getElementById("player-filter"),
    playerOptions: document.getElementById("player-options"),
-   strengthState: document.getElementById("strength-filter"),
    shotResult: document.getElementById("shot-result-filter"),
    homeAway: document.getElementById("home-away-filter"),
    period: document.getElementById("period-filter"),
@@ -33,7 +32,6 @@ const state = {
    season: latestSeason,
    team: "all",
    player: "",
-   strength_state: "all",
    shot_result: "all",
    home_away: "all",
    period: "all",
@@ -52,7 +50,6 @@ function parseStateFromUrl() {
    if (params.get("season")) state.season = params.get("season");
    if (params.get("team")) state.team = params.get("team");
    if (params.get("player")) state.player = params.get("player");
-   if (params.get("strength_state")) state.strength_state = params.get("strength_state");
    if (params.get("shot_result")) state.shot_result = params.get("shot_result");
    if (params.get("home_away")) state.home_away = params.get("home_away");
    if (params.get("period")) state.period = params.get("period");
@@ -72,7 +69,6 @@ function syncUrl() {
    if (state.season) params.set("season", state.season);
    if (state.team !== "all") params.set("team", state.team);
    if (state.player) params.set("player", state.player);
-   if (state.strength_state !== "all") params.set("strength_state", state.strength_state);
    if (state.shot_result !== "all") params.set("shot_result", state.shot_result);
    if (state.home_away !== "all") params.set("home_away", state.home_away);
    if (state.period !== "all") params.set("period", state.period);
@@ -112,7 +108,6 @@ function syncControlsFromState() {
    controls.season.value = state.season || latestSeason || "all";
    controls.team.value = state.team;
    controls.player.value = state.player;
-   controls.strengthState.value = state.strength_state;
    controls.shotResult.value = state.shot_result;
    controls.homeAway.value = state.home_away;
    controls.period.value = state.period;
@@ -125,7 +120,6 @@ function readControlsIntoState() {
    state.season = controls.season.value === "all" ? "" : controls.season.value;
    state.team = controls.team.value;
    state.player = controls.player.value.trim();
-   state.strength_state = controls.strengthState.value;
    state.shot_result = controls.shotResult.value;
    state.home_away = controls.homeAway.value;
    state.period = controls.period.value;
@@ -143,7 +137,6 @@ function buildQueryParams() {
    if (state.season) params.set("season", state.season);
    if (state.team !== "all") params.set("team", state.team);
    if (state.player) params.set("player", state.player);
-   if (state.strength_state !== "all") params.set("strength_state", state.strength_state);
    if (state.shot_result !== "all") params.set("shot_result", state.shot_result);
    if (state.home_away !== "all") params.set("home_away", state.home_away);
    if (state.period !== "all") params.set("period", state.period);
@@ -295,7 +288,6 @@ async function initialize() {
    populateSelect(controls.season, options.seasons || [], "All seasons");
    populateSelect(controls.team, options.teams || [], "All teams");
    populatePlayers(options.players || []);
-   populateSelect(controls.strengthState, options.strength_states || [], "All strengths");
    populateSelect(controls.shotResult, options.shot_results || [], "All shot results");
    populateSelect(controls.homeAway, options.home_away || [], "All locations");
    populateSelect(controls.period, options.periods || [], "All periods");
@@ -352,7 +344,6 @@ async function initialize() {
       state.season = latestSeason || state.season;
       state.team = "all";
       state.player = "";
-      state.strength_state = "all";
       state.shot_result = "all";
       state.home_away = "all";
       state.period = "all";

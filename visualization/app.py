@@ -50,7 +50,6 @@ def create_app(db_path: str) -> Flask:
                "season": filters.season,
                "team": filters.team,
                "player": filters.player,
-               "strength_state": filters.strength_state,
                "shot_result": filters.shot_result,
                "home_away": filters.home_away,
                "period": filters.period,

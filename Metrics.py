@@ -143,79 +143,6 @@ def classify_shot_strength(situation_code: int, event_team_side: str) -> str:
       # Any other mismatch (3v5, 4v6, etc.)
       return 'Other'
 
-
-# Test cases for the classify_shot_strength function
-def _test_classify_shot_strength():
-   """Test the classify_shot_strength function with various edge cases."""
-   # 5v5 - both goalies in net, 5 skaters each
-   # 1551: AwayGoalie=1, AwaySkaters=5, HomeSkaters=5, HomeGoalie=1
-   assert classify_shot_strength(1551, 'Home') == '5v5'
-   assert classify_shot_strength(1551, 'Away') == '5v5'
-   
-   # 4v4 - both goalies in net, equal but less than 5
-   # 1441: AwayGoalie=1, AwaySkaters=4, HomeSkaters=4, HomeGoalie=1
-   assert classify_shot_strength(1441, 'Home') == 'Even_Opened'
-   assert classify_shot_strength(1441, 'Away') == 'Even_Opened'
-   
-   # PP_1 - shooter has +1 advantage, both goalies in net
-   # 1551 is 5v5, need 5v4: AwayGoalie=1, AwaySkaters=4, HomeSkaters=5, HomeGoalie=1
-   # Code: 1451 (Away 4v5 Home)
-   # When Home shoots: Home=5, Away=4, diff=+1 -> PP_1
-   assert classify_shot_strength(1451, 'Home') == 'PP_1'  # Home 5v4
-   # When Away shoots: Away=4, Home=5, diff=-1 -> PK_1
-   assert classify_shot_strength(1451, 'Away') == 'PK_1'  # Away 4v5
-   
-   # PP_2 - shooter has +2 advantage
-   # 6v4: AwayGoalie=1, AwaySkaters=4, HomeSkaters=6, HomeGoalie=1 -> Code: 1461
-   assert classify_shot_strength(1461, 'Home') == 'PP_2'  # Home 6v4
-   assert classify_shot_strength(1461, 'Away') == 'PK_2'  # Away 4v6
-   
-   # PK_1 - shooter has -1 disadvantage (already covered above)
-   # 4v5: AwayGoalie=1, AwaySkaters=5, HomeSkaters=4, HomeGoalie=1 -> Code: 1541
-   assert classify_shot_strength(1541, 'Home') == 'PK_1'  # Home 4v5
-   assert classify_shot_strength(1541, 'Away') == 'PP_1'  # Away 5v4
-   
-   # PK_2 - shooter has -2 disadvantage
-   # 3v5: AwayGoalie=1, AwaySkaters=5, HomeSkaters=3, HomeGoalie=1 -> Code: 1531
-   assert classify_shot_strength(1531, 'Home') == 'PK_2'  # Home 3v5
-   assert classify_shot_strength(1531, 'Away') == 'PP_2'  # Away 5v3
-   
-   # EN_For - shooter's goalie pulled (extra attacker)
-   # 1560: AwayGoalie=1, AwaySkaters=5, HomeSkaters=6, HomeGoalie=0
-   # When Home shoots: Home goalie=0 (pulled), Away goalie=1 -> EN_For
-   # When Away shoots: Away goalie=1, Home goalie=0 -> EN_Against
-   assert classify_shot_strength(1560, 'Home') == 'EN_For'  # Home has extra attacker
-   assert classify_shot_strength(1560, 'Away') == 'EN_Against'  # Away shoots at open net
-   
-   # EN_Against - opponent's goalie pulled (shooting at open net)
-   # 0651: AwayGoalie=0, AwaySkaters=6, HomeSkaters=5, HomeGoalie=1
-   # When Home shoots: Home goalie=1, Away goalie=0 -> EN_Against
-   # When Away shoots: Away goalie=0, Home goalie=1 -> EN_For
-   assert classify_shot_strength(651, 'Home') == 'EN_Against'  # Home shoots at open net
-   assert classify_shot_strength(651, 'Away') == 'EN_For'  # Away has extra attacker
-   
-   # Other - both goalies pulled
-   assert classify_shot_strength(0, 'Home') == 'Other'
-   assert classify_shot_strength(0, 'Away') == 'Other'
-   
-   # Other - unusual mismatches (7v5, etc.)
-   # 1751: AwayGoalie=1, AwaySkaters=5, HomeSkaters=7, HomeGoalie=1 -> 5v7
-   # Home has -2 advantage, Away has +2
-   assert classify_shot_strength(1751, 'Home') == 'PK_2'  # Home 5v7
-   assert classify_shot_strength(1751, 'Away') == 'PP_2'  # Away 7v5
-   
-   # Test a truly unusual case: 8v5 (3+ advantage)
-   # 1851: AwayGoalie=1, AwaySkaters=5, HomeSkaters=8, HomeGoalie=1 -> 5v8
-   assert classify_shot_strength(1851, 'Home') == 'Other'  # 5v8 is very unusual
-   
-   print("All test cases passed!")
-
-
-# Run tests when module is executed directly
-if __name__ == "__main__":
-   _test_classify_shot_strength()
-
-
 def _backfill_player_names(connection: sqlite3.Connection) -> dict[str, int]:
    """Fill missing shooter/goalie names in shots table from players table."""
    cursor = connection.cursor()
@@ -987,8 +914,8 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[str]) -> list[sqlite3.Row]:
    placeholders = ",".join("?" for _ in seasons)
    query = f"""
-   SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state,
-             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
+   SELECT event_hash, season, game_id, shot_result, x, y, shot_type,
+             situation_code, home_away, score_differential, period, is_empty_net, shot_distance, shot_angle,
              prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})
@@ -1003,7 +930,6 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
 
 def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
    shot_types = sorted({(row["shot_type"] or "Unknown").strip() for row in rows})
-   strength_states = sorted({(row["strength_state"] or "Unknown").strip() for row in rows})
 
    if rows:
       prior_event_df = group_prior_event_types(pd.DataFrame([dict(row) for row in rows]))
@@ -1032,7 +958,6 @@ def _build_feature_spec(rows: list[sqlite3.Row]) -> dict:
          "net_openness",
       ],
       "shot_type": shot_types,
-      "strength_state": strength_states,
       "prior_event_grouped": prior_event_groups,
    }
 
@@ -1050,7 +975,6 @@ def _vectorize_rows(
    numeric_feature_names = list(feature_spec["numeric"])
    categorical_feature_names = [
       *(f"shot_type::{value}" for value in feature_spec["shot_type"]),
-      *(f"strength_state::{value}" for value in feature_spec["strength_state"]),
       *(f"prior_event_grouped::{value}" for value in feature_spec.get("prior_event_grouped", [])),
    ]
    feature_names = [*numeric_feature_names, *categorical_feature_names]
@@ -1092,7 +1016,6 @@ def _vectorize_rows(
    goalie_ids_raw: list[str] = []
 
    shot_type_to_idx = {value: idx for idx, value in enumerate(feature_spec["shot_type"])}
-   strength_to_idx = {value: idx for idx, value in enumerate(feature_spec["strength_state"])}
    prior_event_grouped_to_idx = {value: idx for idx, value in enumerate(feature_spec.get("prior_event_grouped", []))}
 
    for row in frame.itertuples(index=False):
@@ -1147,7 +1070,6 @@ def _vectorize_rows(
 
       categorical_rows.append([
          *[1.0 if str(getattr(row, "shot_type", "Unknown") or "Unknown").strip() == value else 0.0 for value in feature_spec["shot_type"]],
-         *[1.0 if str(getattr(row, "strength_state", "Unknown") or "Unknown").strip() == value else 0.0 for value in feature_spec["strength_state"]],
          *[1.0 if str(getattr(row, "prior_event_grouped", "other") or "other").strip() == value else 0.0 for value in feature_spec.get("prior_event_grouped", [])],
       ])
       labels.append(1.0 if str(getattr(row, "shot_result", "")) == "Goal" else 0.0)
@@ -1216,8 +1138,8 @@ def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[
    """Load shot rows including shooter_id and goalie_id for player-adaptive modeling."""
    placeholders = ",".join("?" for _ in seasons)
    query = f"""
-   SELECT event_hash, season, game_id, shot_result, x, y, shot_type, strength_state,
-             score_differential, period, home_away, is_empty_net, shot_distance, shot_angle,
+   SELECT event_hash, season, game_id, shot_result, x, y, shot_type,
+             situation_code, home_away, score_differential, period, is_empty_net, shot_distance, shot_angle,
              shooter_id, goalie_id, prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})

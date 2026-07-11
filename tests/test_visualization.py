@@ -37,7 +37,6 @@ def _sample_row(**overrides):
       "Shot_Distance": 18.5,
       "Shot_Angle": 22.0,
       "Is_Empty_Net": 0,
-      "Strength_State": "5v5",
       "Score_Differential": 0,
       "Zone": "OZ",
       "Event_ID": 5001,
@@ -66,7 +65,6 @@ class TestVisualizationQueryEngine(unittest.TestCase):
                Year="2024",
                GameID=11,
                Shot_Type="Slap Shot",
-               Strength_State="5v4",
                Score_Differential=-1,
                Zone="DZ",
                Event_ID=5002,
@@ -82,7 +80,6 @@ class TestVisualizationQueryEngine(unittest.TestCase):
                Period=3,
                Year="2023",
                GameID=12,
-               Strength_State="5v5",
                Score_Differential=1,
                Zone="NZ",
                Event_ID=5003,
@@ -98,7 +95,6 @@ class TestVisualizationQueryEngine(unittest.TestCase):
       self.assertIn("2024", options["seasons"])
       self.assertIn("TOR", options["teams"])
       self.assertIn("Shooter One", options["players"])
-      self.assertIn("5v5", options["strength_states"])
 
    def test_get_summary_with_filters(self):
       summary = get_summary(self.db_path, HeatmapFilters(season="2024", team="TOR"))
@@ -118,7 +114,6 @@ class TestVisualizationQueryEngine(unittest.TestCase):
             "season": "2024",
             "team": "TOR",
             "player": "Shooter One",
-            "strength_state": "5v5",
             "shot_result": "Goal",
             "home_away": "home",
             "period": "1",
@@ -127,7 +122,6 @@ class TestVisualizationQueryEngine(unittest.TestCase):
       self.assertEqual(filters.season, "2024")
       self.assertEqual(filters.team, "TOR")
       self.assertEqual(filters.player, "Shooter One")
-      self.assertEqual(filters.strength_state, "5v5")
       self.assertEqual(filters.shot_result, "Goal")
       self.assertEqual(filters.home_away, 1)
       self.assertEqual(filters.period, 1)
