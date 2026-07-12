@@ -464,7 +464,10 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
       x_coord = details.get("xCoord")
       y_coord = details.get("yCoord")
 
-      if event_key in {"goal", "shot-on-goal", "shot"}:
+      # Extract period early - needed for last_coord_event tracking
+      period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
+
+      if event_key in {"goal", "shot-on-goal", "shot", "blocked-shot"}:
          if x_coord is None or y_coord is None:
             continue
 
@@ -519,9 +522,6 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
          shooter_id = _coerce_int(_first_non_none(details.get("shootingPlayerId"), details.get("scoringPlayerId"), details.get("playerId")))
          goalie = _normalize_text(_first_non_none(details.get("goalieInNetName"), details.get("goalieName")))
          goalie_id = _coerce_int(_first_non_none(details.get("goalieInNetId"), details.get("goalieId")))
-         period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
-         # period_time is at play level as timeInPeriod, not in about/periodTime
-         period_time = _normalize_text(_first_non_none(about.get("periodTime"), play.get("periodTime"), play.get("timeInPeriod")))
          period_time_remaining = _normalize_text(
             _first_non_none(
                about.get("periodTimeRemaining"),
@@ -557,7 +557,7 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
 
          rows.append(
             {
-               "Shot": "Goal" if event_key == "goal" else "ngshot",
+               "Shot": event_key,
                "X": float(x_coord),
                "Y": float(y_coord),
                "Shot_Type": shot_type,
@@ -566,7 +566,6 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
                "Team": team_code,
                "Home_Away": _home_away_value(team_code, home_code, away_code),
                "Period": period,
-               "Period_Time": period_time,
                "Period_Time_Remaining": period_time_remaining,
                "Year": season,
                "GameID": game_id,
@@ -650,7 +649,6 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
       event_id = _coerce_int(record.get("eventId"))
       shooter_id = _coerce_int(record.get("playerId"))
       goalie_id = _coerce_int(record.get("goalieId"))
-      period_time = _normalize_text(record.get("periodTime"))
       period_time_remaining = _normalize_text(record.get("periodTimeRemaining"))
 
       rows.append(
@@ -664,7 +662,6 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
             "Team": record.get("teamAbbrev") or record.get("teamTriCode"),
             "Home_Away": None,
             "Period": record.get("period"),
-            "Period_Time": period_time,
             "Period_Time_Remaining": period_time_remaining,
             "Year": season,
             "GameID": game_id,
@@ -697,7 +694,7 @@ def initialize_database(db_path: str) -> None:
          CREATE TABLE IF NOT EXISTS shots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_hash TEXT NOT NULL,
-            shot_result TEXT NOT NULL,
+            shot_result TEXT,
             x REAL NOT NULL,
             y REAL NOT NULL,
             shot_type TEXT,
@@ -706,7 +703,6 @@ def initialize_database(db_path: str) -> None:
             team TEXT,
             home_away INTEGER,
             period INTEGER,
-            period_time TEXT,
             period_time_remaining TEXT,
             season TEXT NOT NULL,
             game_id INTEGER NOT NULL,
@@ -736,8 +732,6 @@ def initialize_database(db_path: str) -> None:
          cursor.execute("ALTER TABLE shots ADD COLUMN api_source TEXT NOT NULL DEFAULT 'web'")
       if "shooter_id" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN shooter_id INTEGER")
-      if "period_time" not in columns:
-         cursor.execute("ALTER TABLE shots ADD COLUMN period_time TEXT")
       if "period_time_remaining" not in columns:
          cursor.execute("ALTER TABLE shots ADD COLUMN period_time_remaining TEXT")
       if "goalie" not in columns:
@@ -1036,7 +1030,6 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          row["Team"],
          row["Home_Away"],
          row["Period"],
-         row.get("Period_Time"),
          row.get("Period_Time_Remaining"),
          row["Year"],
          row["GameID"],
@@ -1063,11 +1056,11 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
       """
       INSERT INTO shots (
          event_hash, shot_result, x, y, shot_type, shooter, shooter_id, team,
-         home_away, period, period_time, period_time_remaining, season, game_id, api_source,
+         home_away, period, period_time_remaining, season, game_id, api_source,
          goalie, goalie_id, shot_distance, shot_angle, is_empty_net,
          situation_code, score_differential, zone, event_id, prev_event_type, prev_event_x, prev_event_y,
          prev_event_seconds_ago
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_hash) DO UPDATE SET
          shot_result = excluded.shot_result,
          x = excluded.x,
@@ -1078,7 +1071,6 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          team = excluded.team,
          home_away = COALESCE(excluded.home_away, shots.home_away),
          period = COALESCE(excluded.period, shots.period),
-         period_time = COALESCE(excluded.period_time, shots.period_time),
          period_time_remaining = COALESCE(excluded.period_time_remaining, shots.period_time_remaining),
          season = excluded.season,
          game_id = excluded.game_id,
@@ -1100,7 +1092,6 @@ def _persist_rows_with_cursor(cursor: sqlite3.Cursor, rows: list[dict]) -> int:
          COALESCE(excluded.shooter_id, shots.shooter_id) IS NOT shots.shooter_id
          OR COALESCE(excluded.home_away, shots.home_away) IS NOT shots.home_away
          OR COALESCE(excluded.period, shots.period) IS NOT shots.period
-         OR COALESCE(excluded.period_time, shots.period_time) IS NOT shots.period_time
          OR COALESCE(excluded.period_time_remaining, shots.period_time_remaining) IS NOT shots.period_time_remaining
          OR COALESCE(excluded.api_source, shots.api_source) IS NOT shots.api_source
          OR COALESCE(excluded.goalie, shots.goalie) IS NOT shots.goalie

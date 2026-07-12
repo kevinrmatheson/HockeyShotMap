@@ -27,7 +27,6 @@ def _sample_row(**overrides):
       "Team": "TOR",
       "Home_Away": 1,
       "Period": 1,
-      "Period_Time": "12:34",
       "Period_Time_Remaining": "07:26",
       "Year": "2024",
       "GameID": 10,

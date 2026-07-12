@@ -201,6 +201,73 @@ Run and export Tableau-compatible CSV:
 python Main.py --export-csv 2018NHLShotInfoV2.csv
 ```
 
+## Database reset and data population order
+
+### What `reset_db.py` does
+
+The `reset_db.py` script drops all tables in your SQLite database, effectively resetting it to a clean state. It:
+
+1. Checks if the database file exists
+2. Lists all tables that will be dropped
+3. Drops each table (excluding internal SQLite tables like `sqlite_sequence`)
+4. Closes the connection
+
+This is useful when you want to start fresh with a new scrape or when you need to rebuild derived tables after schema changes.
+
+**Note:** This script does not delete the database file itself, only the tables within it.
+
+### Recommended order for populating tables
+
+The scripts in this project have dependencies on each other. Here's the recommended order to run them to populate all tables:
+
+1. **Reset the database (optional)** - Start fresh if needed:
+   ```bash
+   python reset_db.py
+   ```
+
+2. **Run the main scraper** - Populates the core `shots` table and optionally `edge_payloads`/`edge_detail_payloads`:
+   ```bash
+   python Main.py --season 2024
+   ```
+   This creates the `shots` table with all shot/goal event data.
+
+3. **Fetch player biographical data** - Populates the `players` table (optional but recommended for enriched analysis):
+   ```bash
+   python player_bio.py --db-path hockey_data.db
+   ```
+   This fetches player info (height, weight, position, draft info, etc.) for shooters and goalies found in your shot data.
+
+4. **Run metrics computation** - Populates `shot_xg`, `metrics_model_runs`, `player_career_trajectory`, `goalie_career_trajectory`, and other derived tables:
+   ```bash
+   python Metrics.py --db-path hockey_data.db --season 2024
+   ```
+   This requires the `shots` table to exist and optionally the `players` table for player-adaptive models.
+
+5. **Run age-adjusted metrics (optional)** - Populates age-adjusted tables:
+   ```bash
+   python age_model.py --db-path hockey_data.db --season 2024
+   ```
+
+### Quick reference: Table dependencies
+
+```
+shots (Main.py) ───────────────┐
+                               ├──► shot_xg (Metrics.py)
+players (player_bio.py) ───────┘
+                               ├──► player_career_trajectory (Metrics.py)
+                               ├──► goalie_career_trajectory (Metrics.py)
+                               └──► metrics_model_runs (Metrics.py)
+```
+
+### Alternative: Backfill player stats
+
+If you already have shot data and want to add player seasonal stats (separate from biographical data), use:
+
+```bash
+# Backfill for a specific season
+python -c "import Main; Main.fetch_and_store_player_season_stats('hockey_data.db', '2024', '02', 10)"
+```
+
 ## Run advanced metrics (post-scrape)
 
 Advanced metrics are computed in a separate standalone script so the scrape path in `Main.py` stays unchanged.
@@ -413,7 +480,6 @@ Export fields are preserved in this order:
 - `Team`
 - `Home_Away`
 - `Period`
-- `Period_Time`
 - `Period_Time_Remaining`
 - `Year`
 - `GameID`
