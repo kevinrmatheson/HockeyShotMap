@@ -131,12 +131,12 @@ class TestMainPipeline(unittest.TestCase):
 
         rows = Main.parse_web_shot_events(payload, "2023", 204)
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["Shot"], "Goal")
+        self.assertEqual(rows[0]["Shot"], "goal")
         self.assertEqual(rows[0]["API_Source"], "web")
         self.assertEqual(rows[0]["Shooter_ID"], 11)
         self.assertEqual(rows[0]["Goalie"], "Goalie X")
         self.assertEqual(rows[0]["Event_ID"], 101)
-        self.assertEqual(rows[1]["Shot"], "ngshot")
+        self.assertEqual(rows[1]["Shot"], "shot-on-goal")
         self.assertEqual(rows[1]["Home_Away"], 0)
         self.assertEqual(rows[1]["Goalie_ID"], 42)
         self.assertEqual(rows[1]["Is_Empty_Net"], 0)
@@ -250,7 +250,7 @@ class TestMainPipeline(unittest.TestCase):
         Main.initialize_database(db_path)
 
         base_row = {
-            "Shot": "Goal",
+            "Shot": "goal",
             "X": 20.0,
             "Y": -3.0,
             "Shot_Type": "Wrist Shot",
@@ -350,7 +350,7 @@ class TestMainPipeline(unittest.TestCase):
 
     def test_persist_rows_is_idempotent(self):
         row = {
-            "Shot": "Goal",
+            "Shot": "goal",
             "X": 20.0,
             "Y": -3.0,
             "Shot_Type": "Wrist Shot",
@@ -441,7 +441,7 @@ class TestMainPipeline(unittest.TestCase):
 
         # Insert a row with shooter_id and goalie_id but no names
         row = {
-            "Shot": "Goal",
+            "Shot": "goal",
             "X": 20.0,
             "Y": -3.0,
             "Shot_Type": "Wrist Shot",

@@ -14,7 +14,7 @@ The project now also includes a separate read-only visualization app in [visuali
 
 For each shot or goal event, [Main.py](Main.py) records:
 
-- shot result (`Goal` or `ngshot` for non-goal shots)
+- shot result (`Goal`, `Shot-on-goal`, `Missed-shot`, or `Blocked-shot`)
 - x/y rink coordinates
 - shot type
 - shooter name

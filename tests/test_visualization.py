@@ -18,7 +18,7 @@ from visualization.query_engine import (
 
 def _sample_row(**overrides):
    row = {
-      "Shot": "Goal",
+      "Shot": "goal",
       "X": 20.1,
       "Y": 10.1,
       "Shot_Type": "Wrist Shot",
@@ -53,7 +53,7 @@ class TestVisualizationQueryEngine(unittest.TestCase):
          [
             _sample_row(),
             _sample_row(
-               Shot="ngshot",
+               Shot="shot-on-goal",
                X=21.3,
                Y=11.0,
                Shooter="Shooter Two",
@@ -69,7 +69,7 @@ class TestVisualizationQueryEngine(unittest.TestCase):
                Event_ID=5002,
             ),
             _sample_row(
-               Shot="Goal",
+               Shot="goal",
                X=-10.5,
                Y=-6.2,
                Shooter="Shooter Three",
@@ -113,7 +113,7 @@ class TestVisualizationQueryEngine(unittest.TestCase):
             "season": "2024",
             "team": "TOR",
             "player": "Shooter One",
-            "shot_result": "Goal",
+            "shot_result": "goal",
             "home_away": "home",
             "period": "1",
          }
@@ -121,7 +121,7 @@ class TestVisualizationQueryEngine(unittest.TestCase):
       self.assertEqual(filters.season, "2024")
       self.assertEqual(filters.team, "TOR")
       self.assertEqual(filters.player, "Shooter One")
-      self.assertEqual(filters.shot_result, "Goal")
+      self.assertEqual(filters.shot_result, "goal")
       self.assertEqual(filters.home_away, 1)
       self.assertEqual(filters.period, 1)
 

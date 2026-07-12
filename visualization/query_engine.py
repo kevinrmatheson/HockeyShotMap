@@ -87,7 +87,7 @@ def get_filter_options(db_path: str) -> dict[str, list[str]]:
       "teams": [row["team"] for row in team_rows if row["team"]],
       "players": [row["shooter"] for row in player_rows if row["shooter"]],
       "periods": [str(row["period"]) for row in period_rows if row["period"] is not None],
-      "shot_results": ["all", "Goal", "ngshot"],
+      "shot_results": ["all", "Goal", "Shot-on-goal", "Missed-shot"],
       "home_away": ["all", "home", "away"],
    }
 

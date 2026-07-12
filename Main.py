@@ -467,7 +467,7 @@ def parse_web_shot_events(game_json: dict, season: str, game_id: int) -> list[di
       # Extract period early - needed for last_coord_event tracking
       period = _coerce_int(_first_non_none(period_descriptor.get("number"), about.get("period")))
 
-      if event_key in {"goal", "shot-on-goal", "shot", "blocked-shot"}:
+      if event_key in {"goal", "shot-on-goal", "missed-shot", "blocked-shot"}:
          if x_coord is None or y_coord is None:
             continue
 
@@ -653,7 +653,7 @@ def parse_stats_shift_events(payload: dict | list, season: str, game_id: int) ->
 
       rows.append(
          {
-            "Shot": "Goal" if "goal" in event_type else "ngshot",
+            "Shot": event_type,
             "X": float(x_coord),
             "Y": float(y_coord),
             "Shot_Type": record.get("shotType") or "Unknown",

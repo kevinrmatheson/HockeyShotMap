@@ -687,7 +687,7 @@ def _collect_source_fingerprint(connection: sqlite3.Connection, seasons: list[st
              COALESCE(MAX(id), 0) AS max_shot_id
       FROM shots
       WHERE season IN ({placeholders})
-        AND shot_result IN ('Goal', 'ngshot')
+        AND shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
@@ -919,7 +919,7 @@ def _load_shot_rows_for_features(connection: sqlite3.Connection, seasons: list[s
              prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})
-        AND shot_result IN ('Goal', 'ngshot')
+        AND shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
@@ -1143,7 +1143,7 @@ def _load_shot_rows_with_entities(connection: sqlite3.Connection, seasons: list[
              shooter_id, goalie_id, prev_event_type, prev_event_x, prev_event_y, prev_event_seconds_ago
       FROM shots
       WHERE season IN ({placeholders})
-        AND shot_result IN ('Goal', 'ngshot')
+        AND shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
         AND x IS NOT NULL
         AND y IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
@@ -1838,7 +1838,7 @@ def _compute_team_strength_metrics(
       JOIN shot_xg x ON x.event_hash = s.event_hash
       WHERE x.model_version = ?
         AND s.season IN ({placeholders})
-        AND s.shot_result IN ('Goal', 'ngshot')
+        AND s.shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
       GROUP BY s.team, s.season
    """, [model_version, *seasons]).fetchall()
 
@@ -1850,7 +1850,7 @@ def _compute_team_strength_metrics(
       FROM shots s
       WHERE s.season IN ({placeholders})
         AND s.goalie_id IS NOT NULL
-        AND s.shot_result IN ('Goal', 'ngshot')
+        AND s.shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
       GROUP BY s.team
    """, seasons).fetchall()
 
@@ -1917,7 +1917,7 @@ def _compute_player_season_advanced_metrics(
       SELECT shooter_id, season, COUNT(DISTINCT game_id) AS games_played
       FROM shots
       WHERE season IN ({','.join('?' for _ in seasons)})
-        AND shot_result IN ('Goal', 'ngshot')
+        AND shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
         AND shooter_id IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
         AND zone = 'O'
@@ -2135,7 +2135,7 @@ def _compute_player_career_advanced(
       SELECT shooter_id, season, COUNT(DISTINCT game_id) AS games_played
       FROM shots
       WHERE season IN ({','.join('?' for _ in seasons)})
-        AND shot_result IN ('Goal', 'ngshot')
+        AND shot_result IN ('goal', 'shot-on-goal', 'missed-shot')
         AND shooter_id IS NOT NULL
         AND COALESCE(is_empty_net, 0) = 0
       GROUP BY shooter_id, season
