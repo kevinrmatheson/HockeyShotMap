@@ -81,13 +81,42 @@ def get_filter_options(db_path: str) -> dict[str, list[str]]:
       period_rows = connection.execute(
          "SELECT DISTINCT period FROM shots WHERE period IS NOT NULL ORDER BY period"
       ).fetchall()
+      # Get actual shot_result values from database
+      shot_result_rows = connection.execute(
+         "SELECT DISTINCT shot_result FROM shots WHERE shot_result IS NOT NULL ORDER BY shot_result"
+      ).fetchall()
+
+   # Build shot_results list including "all" and actual values from database
+   shot_results = ["all"]
+   for row in shot_result_rows:
+      shot_result = row["shot_result"]
+      # Normalize common shot result values
+      if shot_result == "goal":
+         shot_results.append("Goal")
+      elif shot_result == "missed-shot":
+         shot_results.append("missed-shot")
+      elif shot_result == "shot-on-goal":
+         shot_results.append("shot-on-goal")
+      elif shot_result == "blocked-shot":
+         shot_results.append("blocked-shot")
+      else:
+         # Add any other shot_result values as-is
+         shot_results.append(shot_result)
+
+   # Remove duplicates while preserving order
+   seen = set()
+   unique_shot_results = []
+   for result in shot_results:
+      if result not in seen:
+         seen.add(result)
+         unique_shot_results.append(result)
 
    return {
       "seasons": [row["season"] for row in season_rows if row["season"]],
       "teams": [row["team"] for row in team_rows if row["team"]],
       "players": [row["shooter"] for row in player_rows if row["shooter"]],
       "periods": [str(row["period"]) for row in period_rows if row["period"] is not None],
-      "shot_results": ["all", "Goal", "Shot-on-goal", "Missed-shot"],
+      "shot_results": unique_shot_results,
       "home_away": ["all", "home", "away"],
    }
 
@@ -97,7 +126,7 @@ def get_summary(db_path: str, filters: HeatmapFilters) -> dict[str, Any]:
    query = f"""
       SELECT
          COUNT(*) AS shot_count,
-         SUM(CASE WHEN shot_result = 'Goal' THEN 1 ELSE 0 END) AS goal_count
+         SUM(CASE WHEN shot_result = 'goal' THEN 1 ELSE 0 END) AS goal_count
       FROM shots
       WHERE {where_clause}
         AND x IS NOT NULL

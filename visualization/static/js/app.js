@@ -310,10 +310,6 @@ async function initialize() {
       readControlsIntoState();
       refreshDashboard().catch(console.error);
    });
-   controls.strengthState.addEventListener("change", () => {
-      readControlsIntoState();
-      refreshDashboard().catch(console.error);
-   });
    controls.shotResult.addEventListener("change", () => {
       readControlsIntoState();
       refreshDashboard().catch(console.error);
