@@ -775,5 +775,14 @@ def main() -> None:
     run_player_bio_fetch(config)
 
 
+def fetch_player_bios(config: PlayerBioConfig) -> tuple[int, int]:
+    """
+    Wrapper function for use by the orchestrator.
+    Returns (players_processed, bios_inserted).
+    """
+    total_fetched, total_skipped, total_not_found, total_errors = run_player_bio_fetch(config)
+    return total_fetched, total_fetched - total_skipped - total_not_found - total_errors
+
+
 if __name__ == "__main__":
     main()
