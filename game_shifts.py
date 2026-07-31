@@ -86,9 +86,11 @@ def _parse_shift_record(record: dict, season: str, game_id: int) -> dict | None:
         except (ValueError, TypeError):
             pass
 
+    player_name = _extract_player_name(record) or "Unknown"
+
     return {
         "player_id": int(player_id),
-        "player_name": str(record.get("playerName", record.get("fullName", "Unknown"))),
+        "player_name": player_name,
         "team_id": int(team_id),
         "team_abbrev": str(record.get("teamAbbrev", record.get("teamCode", "Unknown"))),
         "season": season,
@@ -103,6 +105,44 @@ def _parse_shift_record(record: dict, season: str, game_id: int) -> dict | None:
         "position": _normalize_text(record.get("position", record.get("positionCode"))),
         "fetched_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+
+
+def _name_piece_to_text(value: object) -> str | None:
+    """Normalize first/last name payload shapes into text."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        # Web API often uses locale maps like {"default": "Name"}
+        for key in ("default", "full", "name", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _extract_player_name(record: dict) -> str | None:
+    """Extract player name across known NHL payload field variants."""
+    candidates = [
+        record.get("playerName"),
+        record.get("fullName"),
+        record.get("skaterFullName"),
+        record.get("goalieFullName"),
+        record.get("name"),
+    ]
+
+    for candidate in candidates:
+        text = _name_piece_to_text(candidate)
+        if text:
+            return text
+
+    # Some payloads split first/last names.
+    first = _name_piece_to_text(record.get("firstName"))
+    last = _name_piece_to_text(record.get("lastName"))
+    full = " ".join(part for part in (first, last) if part).strip()
+    return full or None
 
 
 def _parse_period_time_to_seconds(period_time: str) -> int | None:
@@ -279,7 +319,13 @@ def persist_game_shifts(db_path: str, shifts: list[dict]) -> int:
                 duration_seconds, shift_type, is_shifting, jersey_number, position, fetched_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(shift_hash) DO UPDATE SET
-                player_name = excluded.player_name,
+                player_name = CASE
+                    WHEN excluded.player_name IS NOT NULL
+                         AND TRIM(excluded.player_name) <> ''
+                         AND excluded.player_name <> 'Unknown'
+                    THEN excluded.player_name
+                    ELSE game_shifts.player_name
+                END,
                 team_id = COALESCE(excluded.team_id, game_shifts.team_id),
                 team_abbrev = COALESCE(excluded.team_abbrev, game_shifts.team_abbrev),
                 period = COALESCE(excluded.period, game_shifts.period),
@@ -296,6 +342,35 @@ def persist_game_shifts(db_path: str, shifts: list[dict]) -> int:
         )
         connection.commit()
         return cursor.connection.total_changes - before
+
+
+def backfill_game_shift_player_names(db_path: str) -> int:
+        """Backfill Unknown/blank game_shifts.player_name from players.full_name via player_id."""
+        with sqlite3.connect(db_path) as connection:
+                cursor = connection.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='players'")
+                if cursor.fetchone() is None:
+                        return 0
+
+                cursor.execute(
+                        """
+                        UPDATE game_shifts
+                        SET player_name = (
+                                SELECT full_name
+                                FROM players
+                                WHERE players.player_id = game_shifts.player_id
+                        )
+                        WHERE (player_name IS NULL OR TRIM(player_name) = '' OR player_name = 'Unknown')
+                            AND EXISTS (
+                                SELECT 1
+                                FROM players
+                                WHERE players.player_id = game_shifts.player_id
+                            )
+                        """
+                )
+                filled = cursor.rowcount
+                connection.commit()
+                return int(filled or 0)
 
 
 def fetch_and_store_game_shifts(
@@ -338,6 +413,11 @@ def fetch_and_store_game_shifts(
         season,
         total_inserted,
     )
+
+    backfilled = backfill_game_shift_player_names(db_path)
+    if backfilled > 0:
+        logging.info("Season %s: backfilled %d shift player names from players table", season, backfilled)
+
     return total_inserted
 
 

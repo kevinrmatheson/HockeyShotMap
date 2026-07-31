@@ -6,13 +6,18 @@ The project now also includes a separate read-only visualization app in [visuali
 
 ## Script roles
 
-- [Main.py](Main.py) is the active NHL Web API + Stats REST ETL pipeline.
-- [Scraper.py](Scraper.py) is a separate prototype track for future player-level and cross-league data collection (not integrated into the active pipeline).
-- [DataCleaning.py](DataCleaning.py) contains a basic CSV loader utility for follow-on analysis work.
+- [Main.py](Main.py) is the orchestration entry point. It runs one scraper (`--scraper ...`) or all scrapers (`--all`) across a season or season range.
+- [shots_scraper.py](shots_scraper.py) is the shot and goal ETL pipeline (Web API + Stats REST fallback) that writes the `shots` table and optional EDGE payload tables.
+- [player_season.py](player_season.py) fetches player seasonal skater/goalie summary stats into `player_seasonal_stats`.
+- [player_bio.py](player_bio.py) fetches player biographical profiles into `players`.
+- [team_season.py](team_season.py) fetches team seasonal summary stats.
+- [game_shifts.py](game_shifts.py) fetches shiftcharts by game.
+- [Metrics.py](Metrics.py) computes post-scrape xG and trajectory metrics tables.
+- [Scraper.py](Scraper.py) remains an incubating prototype module and is not part of the production ingestion path.
 
 ## What the active scraper collects
 
-For each shot or goal event, [Main.py](Main.py) records:
+For each shot or goal event, [shots_scraper.py](shots_scraper.py) records:
 
 - shot result (`Goal`, `Shot-on-goal`, `Missed-shot`, or `Blocked-shot`)
 - x/y rink coordinates
@@ -42,14 +47,20 @@ The Edge data families are useful if you want to enrich the shot feed later:
 
 Pipeline flow:
 
+1. Parse CLI options and pick either one scraper (`--scraper`) or all registered scrapers (`--all`).
+2. Resolve seasons from `--season` or `--start-season/--end-season`.
+3. For each selected scraper + season, execute the scraper and collect run summaries.
+4. Log per-scraper season results and a final aggregate summary.
+
+When `--scraper shots` is selected, `Main.py` runs the shot ETL path in [shots_scraper.py](shots_scraper.py):
+
 1. Build game URLs using season-based source rules.
 2. Fetch JSON from NHL API families based on season:
-	- Pre-2009 seasons: NHL Stats REST API only
-	- 2009+ seasons: NHL Web API / Gamecenter first, with NHL Stats REST fallback
+   - Pre-2009 seasons: NHL Stats REST API only
+   - 2009+ seasons: NHL Web API / Gamecenter first, with NHL Stats REST fallback
 3. Parse `Goal` and `Shot` events into normalized rows.
 4. Persist rows into SQLite with duplicate-safe inserts.
-5. Optionally capture NHL Edge summary payloads.
-6. Optionally export CSV format for visualization workflows.
+5. Optionally capture NHL Edge summary/deep payloads.
 
 Web API play-by-play URL format:
 
@@ -59,11 +70,10 @@ Stats REST shiftcharts URL format:
 
 `https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={full_game_id}&limit=-1`
 
-By default, the script uses:
+By default, the orchestrator uses:
 
-- season `2013`
+- all seasons from 2009 through current season
 - regular season game type (`02`)
-- game ids `0001` through `1271`
 - output database `hockey_data.db`
 
 ## Setup
@@ -77,18 +87,30 @@ pip install -r requirements.txt
 
 ## Run the scraper
 
-Default run (regular season, full game range, SQLite output):
+Run all scrapers (shots, player season, team season, shifts, player bio) for default season range:
 
 ```bash
-python Main.py
+python Main.py --all
 ```
 
-By default this runs from 2009 (first season with reliable coordinate shot data) through the current NHL season.
+Run only the shots scraper for one season:
+
+```bash
+python Main.py --scraper shots --season 2024
+```
+
+Run all scrapers for one season:
+
+```bash
+python Main.py --all --season 2024
+```
+
+By default this runs seasons from 2009 (first season with reliable coordinate shot data) through the current NHL season.
 
 **Note on pre-2009 data**: The NHL Web API only has sparse/manual shot coordinates before the 2009-10 season. A few games in 2008 may have coordinates but most do not. To attempt scraping older seasons:
 
 ```bash
-python Main.py --start-season 2008 --end-season 2008 --empty-game-streak 500
+python Main.py --scraper shots --start-season 2008 --end-season 2008
 ```
 
 When a specific game, team, or player endpoint does not exist for a season (for example expansion-era teams in earlier years), 404 responses are treated as optional and skipped so the scrape can continue.
@@ -103,20 +125,20 @@ NHL Edge summary capture is enabled by default for 2021+ seasons.
 Capture NHL Edge snapshots explicitly for each scraped season:
 
 ```bash
-python Main.py --capture-edge
+python Main.py --scraper shots --capture-edge --season 2024
 ```
 
 Disable default EDGE summary capture for a run:
 
 ```bash
-python Main.py --no-capture-edge
+python Main.py --scraper shots --no-capture-edge --season 2024
 ```
 
 EDGE capture is hardcoded to start at 2021+ seasons when enabled.
 
 ## Player seasonal stats
 
-Starting with the 2025-26 season, `Main.py` automatically captures per-player seasonal statistics from the NHL Stats REST API (`/stats/rest/en/skater/summary` and `/stats/rest/en/goalie/summary`) during every scrape run. This includes skater and goalie stats such as:
+Player seasonal stats come from the NHL Stats REST API (`/stats/rest/v1/en/skater/summary` and `/stats/rest/v1/en/goalie/summary`) via [player_season.py](player_season.py). This includes skater and goalie stats such as:
 
 - **Skater**: games played, TOI, goals, assists, points, shots on goal, plus/minus, PIM, power-play goals, short-handed goals, game-winning goals, blocked shots, hits, faceoffs, takeaways, giveaways
 - **Goalie**: save percentage, goals-against average, shutouts
@@ -124,81 +146,54 @@ Starting with the 2025-26 season, `Main.py` automatically captures per-player se
 
 The data is stored in the `player_seasonal_stats` table, keyed by `(player_id, season, game_type)`. This table is indexed by `season`, `team`, and `position` for fast queries.
 
-Player stats are captured by default for all non-EDGE-only scrape runs. To disable:
+Run player seasonal stats through the orchestrator:
 
 ```bash
-python Main.py --season 2024 --no-player-stats
+python Main.py --scraper player_season --season 2024 --game-type 02
 ```
 
-To backfill player stats for a season you've already scraped:
+Run player seasonal stats directly for a season range:
 
 ```bash
-python -c "
-import Main
-Main.fetch_and_store_player_season_stats('hockey_data.db', '2024', '02', 10)
-"
+python player_season.py --start-season 2022 --end-season 2024 --game-type 02 --db-path hockey_data.db
 ```
-
-To backfill player stats for **all seasons** in your database (all game types):
-
-```bash
-python Main.py --player-stats-backfill --db-path hockey_data.db
-```
-
-This will automatically:
-- Detect all seasons from your existing shot data
-- Detect all game types for each season
-- Fetch and store player seasonal stats with rate limiting
-- Skip seasons that already have stats (idempotent)
 
 The Stats REST API provides data going back much further than the NHL Edge API, so this works for all seasons where you have shot data (2009 onward — though the Stats REST skater/goalie summary endpoints reach back much earlier).
 
 Run summary EDGE capture for a single season:
 
 ```bash
-python Main.py --capture-edge --season 2024
+python Main.py --scraper shots --capture-edge --season 2024
 ```
 
 Run deep EDGE capture for a single season:
 
 ```bash
-python Main.py --capture-edge-deep --season 2024
+python Main.py --scraper shots --capture-edge-deep --season 2024
 ```
 
 Run summary and deep EDGE capture in one pass:
 
 ```bash
-python Main.py --capture-edge --capture-edge-deep --season 2024
+python Main.py --scraper shots --capture-edge --capture-edge-deep --season 2024
 ```
 
 Capture the deeper Edge crawl too:
 
 ```bash
-python Main.py --capture-edge --capture-edge-deep
+python Main.py --scraper shots --capture-edge --capture-edge-deep --start-season 2021 --end-season 2024
 ```
 
 Run a bounded season range:
 
 ```bash
-python Main.py --start-season 2013 --end-season 2018
+python Main.py --scraper shots --start-season 2013 --end-season 2018
 ```
 
 Run a single season only:
 
 ```bash
-python Main.py --season 2017
-```
-
-Run a small bounded range:
-
-```bash
-python Main.py --season 2013 --game-type 02 --start-game 1 --end-game 10
-```
-
-Run and export Tableau-compatible CSV:
-
-```bash
-python Main.py --export-csv 2018NHLShotInfoV2.csv
+python Main.py --scraper shots --season 2017
 ```
 
 ## Database reset and data population order
@@ -227,23 +222,28 @@ The scripts in this project have dependencies on each other. Here's the recommen
 
 2. **Run the main scraper** - Populates the core `shots` table and optionally `edge_payloads`/`edge_detail_payloads`:
    ```bash
-   python Main.py --season 2024
+   python Main.py --scraper shots --season 2024
    ```
    This creates the `shots` table with all shot/goal event data.
 
 3. **Fetch player biographical data** - Populates the `players` table (optional but recommended for enriched analysis):
    ```bash
-   python player_bio.py --db-path hockey_data.db
+   python Main.py --scraper player_bio --season 2024 --db-path hockey_data.db
    ```
    This fetches player info (height, weight, position, draft info, etc.) for shooters and goalies found in your shot data.
 
-4. **Run metrics computation** - Populates `shot_xg`, `metrics_model_runs`, `player_career_trajectory`, `goalie_career_trajectory`, and other derived tables:
+4. **Fetch player seasonal stats** - Populates `player_seasonal_stats` (recommended for seasonal analysis and modeling features):
+   ```bash
+   python Main.py --scraper player_season --season 2024 --db-path hockey_data.db
+   ```
+
+5. **Run metrics computation** - Populates `shot_xg`, `metrics_model_runs`, `player_career_trajectory`, `goalie_career_trajectory`, and other derived tables:
    ```bash
    python Metrics.py --db-path hockey_data.db --season 2024
    ```
    This requires the `shots` table to exist and optionally the `players` table for player-adaptive models.
 
-5. **Run age-adjusted metrics (optional)** - Populates age-adjusted tables:
+6. **Run age-adjusted metrics (optional)** - Populates age-adjusted tables:
    ```bash
    python age_model.py --db-path hockey_data.db --season 2024
    ```
@@ -264,8 +264,11 @@ players (player_bio.py) ───────┘
 If you already have shot data and want to add player seasonal stats (separate from biographical data), use:
 
 ```bash
-# Backfill for a specific season
-python -c "import Main; Main.fetch_and_store_player_season_stats('hockey_data.db', '2024', '02', 10)"
+# Backfill one season via orchestrator
+python Main.py --scraper player_season --season 2024 --game-type 02 --db-path hockey_data.db
+
+# Backfill a season range directly
+python player_season.py --start-season 2021 --end-season 2024 --game-type 02 --db-path hockey_data.db
 ```
 
 ## Run advanced metrics (post-scrape)
@@ -424,25 +427,32 @@ Then open the local URL printed in the terminal.
 Use a custom database path:
 
 ```bash
-python Main.py --db-path nhl_shots_2013.db
+python Main.py --all --season 2024 --db-path nhl_shots_2013.db
 ```
 
 Useful CLI arguments:
 
+- `--scraper` (`shots`, `player_season`, `team_season`, `game_shifts`, `player_bio`)
+- `--all`
 - `--season`
 - `--start-season`
 - `--end-season`
 - `--game-type` (`01`, `02`, `03`, `04`)
-- `--api-source` (`web`, `stats`, `both`)
 - `--capture-edge`
+- `--no-capture-edge`
 - `--capture-edge-deep`
-- `--start-game`
-- `--end-game`
-- `--empty-game-streak` (default `200`, increase for older/sparse seasons)
-- `--timeout`
+- `--max-workers`
+- `--request-delay`
 - `--db-path`
-- `--export-csv`
+- `--start-player-id` / `--end-player-id`
+- `--force-refresh`
 - `--log-level`
+
+EDGE flag scope note:
+
+- `--capture-edge`, `--no-capture-edge`, and `--capture-edge-deep` only affect the `shots` scraper.
+- When running `--all`, these flags apply during the `shots` step only.
+- If `--scraper` is set to `player_season`, `team_season`, `game_shifts`, or `player_bio`, EDGE flags are ignored.
 
 ## Storage model
 
